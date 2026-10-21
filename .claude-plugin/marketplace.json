@@ -1,0 +1,14 @@
+{
+  "name": "claude-config",
+  "description": "Personal Claude Code plugins",
+  "owner": {
+    "name": "laimk"
+  },
+  "plugins": [
+    {
+      "name": "laimk",
+      "source": "./plugins/laimk",
+      "description": "Skills and agents ported from pi-config"
+    }
+  ]
+}

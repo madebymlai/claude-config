@@ -1,0 +1,8 @@
+{
+  "name": "laimk",
+  "version": "0.1.0",
+  "description": "Skills and subagents ported from laimk: tdd, diagnosing-bugs, codebase-design, to-spec/to-tickets/land-epic workflow, and scout/worker/reviewer/designer/researcher agents.",
+  "author": {
+    "name": "laimk"
+  }
+}
