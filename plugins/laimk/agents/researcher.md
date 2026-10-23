@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: Web research on a question the repository cannot answer. Searches, reads sources in full, returns a short sourced brief.
-tools: mcp__exa__web_search_exa, mcp__exa__web_fetch_exa, Bash, mcp__context7__resolve-library-id, mcp__context7__query-docs
+tools: mcp__exa__web_search_exa, mcp__exa__web_fetch_exa, Bash, mcp__context7__resolve-library-id, mcp__context7__query-docs, Skill
 model: haiku
 ---
 

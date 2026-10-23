@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Implements a change end to end. Reads, edits and runs code in a repository, then reports what changed and what was verified.
-tools: Read, Write, Edit, Bash, mcp__exa__web_search_exa, mcp__exa__web_fetch_exa, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__get_architecture, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__check_index_coverage, mcp__codebase-memory-mcp__index_status, mcp__context7__resolve-library-id, mcp__context7__query-docs
+tools: Read, Write, Edit, Bash, mcp__exa__web_search_exa, mcp__exa__web_fetch_exa, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__get_architecture, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__check_index_coverage, mcp__codebase-memory-mcp__index_status, mcp__context7__resolve-library-id, mcp__context7__query-docs, Skill
 model: opus
 ---
 

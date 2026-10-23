@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Reviews a diff it did not write and reports defects, each with the concrete input or state that triggers it. Use after a change is made and before it is accepted.
-tools: Read, Grep, Glob, Bash, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__get_architecture, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__check_index_coverage, mcp__codebase-memory-mcp__index_status, mcp__context7__resolve-library-id, mcp__context7__query-docs
+tools: Read, Grep, Glob, Bash, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__get_architecture, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__check_index_coverage, mcp__codebase-memory-mcp__index_status, mcp__context7__resolve-library-id, mcp__context7__query-docs, Skill
 model: opus
 ---
 
