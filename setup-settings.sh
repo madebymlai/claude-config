@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Merge laimk's Claude Code settings into the user settings file
+# ($CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json).
+# The keys below overwrite the same keys there; every other key, hooks
+# included, is kept. Safe to run again.
+set -euo pipefail
+
+command -v jq >/dev/null || { echo "setup-settings: jq is required" >&2; exit 1; }
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+config_dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+settings=$config_dir/settings.json
+
+ours=$(cat <<'JSON'
+{
+  "env": {
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "240000",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1"
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "model": "opus",
+  "effortLevel": "xhigh",
+  "modelSettings": {
+    "claude-opus-5-5": {
+      "effortLevel": "xhigh"
+    }
+  },
+  "worktree": {
+    "bgIsolation": "none",
+    "baseRef": "head"
+  },
+  "enableArtifact": false,
+  "enableWorkflows": false,
+  "workflowKeywordTriggerEnabled": false,
+  "statusLine": {
+    "type": "command",
+    "command": "jq -r '((.context_window.total_input_tokens // 0) + (.context_window.total_output_tokens // 0)) as $used | ($used / 1000 | floor) as $k | (if $k >= 120 then 24 else ($k / 5 | floor) end) as $yellow | (if $k > 120 then ((($k - 120) / 5 | floor) | if . > 24 then 24 else . end) else 0 end) as $red | (reduce range(24) as $i (\"\"; if $i < $red then . + \"\\u001b[38;5;203m\\u2588\" elif $i < $yellow then . + \"\\u001b[38;5;80m\\u2588\" else . + \"\\u001b[38;5;30m\\u2591\" end)) as $bar | $bar + \"\\u001b[0m \" + ($used | tostring | split(\"\") | reverse | [foreach .[] as $c (0; .+1; {c:$c,i:.})] | map(if .i > 1 and ((.i-1) % 3) == 0 then .c + \".\" else .c end) | reverse | join(\"\")) + \" tokens\"'"
+  },
+  "enabledPlugins": {
+    "laimk@claude-config": true
+  },
+  "outputStyle": "Concise",
+  "promptSuggestionEnabled": false,
+  "awaySummaryEnabled": false,
+  "dialogExpiry": "never",
+  "tui": "fullscreen",
+  "autoMemoryEnabled": false,
+  "autoCompactEnabled": false,
+  "switchModelsOnFlag": false,
+  "autoContinueAtUsageLimit": false,
+  "remoteControlAtStartup": false,
+  "agentPushNotifEnabled": true,
+  "useAutoModeDuringPlan": false,
+  "feedbackDrafts": "off"
+}
+JSON
+)
+
+mkdir -p "$config_dir"
+[[ -f $settings ]] || echo '{}' >"$settings"
+
+tmp=$(mktemp "$settings.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+
+# The claude-config marketplace points at this checkout, wherever it is.
+jq --argjson ours "$ours" --arg repo "$repo" '
+  . * $ours
+  * {extraKnownMarketplaces: {"claude-config": {source: {source: "directory", path: $repo}}}}
+' "$settings" >"$tmp"
+mv "$tmp" "$settings"
+
+echo "setup-settings: merged into $settings"
