@@ -97,7 +97,7 @@ def render(data):
     known = used == 0 or (context.get("current_usage") is not None and capacity > 0)
     ratio = used / capacity if known and capacity > 0 else 0
     filled = max(0, min(10, int(ratio * 10)))
-    color = TEXT if not known else RED if ratio >= .9 else PEACH if ratio >= .7 else GREEN
+    color = TEXT if not known else RED if used >= 512_000 else PEACH if used >= 256_000 else GREEN
     bar = "▰" * filled + "▱" * (10 - filled) if known else "░" * 10
     label = tokens(used) if known else "?"
     model = data.get("model") or {}

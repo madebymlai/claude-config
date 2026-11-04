@@ -30,7 +30,8 @@ The one-row Catppuccin Mocha Powerline footer shows:
 
 Startup/no usage shows a green empty bar, `▱▱▱▱▱▱▱▱▱▱ 0`, like Pi.
 Nonzero usage with unknown occupancy still shows `░░░░░░░░░░ ?`.
-Context colors turn peach at 70% and red at 90%.
+Context colors are green below 256k input tokens, peach from 256k, and red from
+512k, independently of the model's context limit.
 
 Claude's **native permission-mode indicator remains below this row**. Claude
 2.1.318 does not send the live mode to custom status lines; no hook tracking or

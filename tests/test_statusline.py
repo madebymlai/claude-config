@@ -75,10 +75,10 @@ class StatusLineTests(unittest.TestCase):
             " Claude  ↑0 ↓0  ▱▱▱▱▱▱▱▱▱▱ 0 \n",
         )
 
-    def test_effective_capacity_scales_clamps_and_colors_the_bar(self):
+    def test_effective_capacity_scales_and_clamps_the_bar_not_warning_thresholds(self):
         for capacity, bar, color in [
-            (100000, "▰▰▰▰▰▰▰▰▱▱", "250;179;135"),
-            (50000, "▰▰▰▰▰▰▰▰▰▰", "243;139;168"),
+            (100000, "▰▰▰▰▰▰▰▰▱▱", "166;227;161"),
+            (50000, "▰▰▰▰▰▰▰▰▰▰", "166;227;161"),
             (0, "░░░░░░░░░░", "205;214;244"),
         ]:
             with self.subTest(capacity=capacity):
@@ -89,6 +89,24 @@ class StatusLineTests(unittest.TestCase):
                 self.assertIn(f"\x1b[38;2;{color}m\x1b[48;2;69;71;90m", line)
                 self.assertNotIn("%", SGR.sub("", line))
                 self.assertNotIn("/", SGR.sub("", line))
+
+    def test_context_colors_turn_peach_at_256k_and_red_at_512k(self):
+        for capacity in (273000, 1000000):
+            for used, color in [
+                (255999, "166;227;161"),
+                (256000, "250;179;135"),
+                (511999, "250;179;135"),
+                (512000, "243;139;168"),
+                (900000, "243;139;168"),
+            ]:
+                with self.subTest(capacity=capacity, used=used):
+                    self.data["context_window"].update(
+                        total_input_tokens=used, context_window_size=capacity,
+                    )
+                    self.assertIn(
+                        f"\x1b[38;2;{color}m\x1b[48;2;69;71;90m",
+                        self.render(),
+                    )
 
     def test_project_and_live_git_branch_use_payload_directory(self):
         repo = self.directory / "demo"
