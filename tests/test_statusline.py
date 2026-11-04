@@ -58,19 +58,21 @@ class StatusLineTests(unittest.TestCase):
         self.assertIn("\x1b[38;2;166;227;161m\x1b[48;2;69;71;90m", line)
         self.assertTrue(line.endswith("\x1b[0m\n"))
 
-    def test_startup_and_missing_fields_show_unknown_not_empty_context(self):
+    def test_startup_and_missing_fields_show_green_empty_bar_and_zero(self):
         self.data["context_window"].update(
             total_input_tokens=0, total_output_tokens=0,
             current_usage=None, used_percentage=None,
         )
         self.data.pop("effort")
+        line = self.render()
         self.assertEqual(
-            SGR.sub("", self.render()),
-            " Opus 5.5  ↑0 ↓0  ░░░░░░░░░░ ? \n",
+            SGR.sub("", line),
+            " Opus 5.5  ↑0 ↓0  ▱▱▱▱▱▱▱▱▱▱ 0 \n",
         )
+        self.assertIn("\x1b[38;2;166;227;161m\x1b[48;2;69;71;90m", line)
         self.assertEqual(
             SGR.sub("", self.render({})),
-            " Claude  ↑0 ↓0  ░░░░░░░░░░ ? \n",
+            " Claude  ↑0 ↓0  ▱▱▱▱▱▱▱▱▱▱ 0 \n",
         )
 
     def test_effective_capacity_scales_clamps_and_colors_the_bar(self):

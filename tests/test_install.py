@@ -64,7 +64,7 @@ class InstallerTests(unittest.TestCase):
                 )
                 self.assertEqual(rendered.returncode, 0, rendered.stderr)
                 self.assertIn("Claude", rendered.stdout)
-                self.assertIn("░░░░░░░░░░ ?", rendered.stdout)
+                self.assertIn("▱▱▱▱▱▱▱▱▱▱ 0", rendered.stdout)
                 self.install(checkout / "setup-statusline.sh")
                 self.assertEqual(settings.read_bytes(), first)
 
@@ -83,7 +83,7 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         self.assertIn("Claude", rendered.stdout)
-        self.assertIn("░░░░░░░░░░ ?", rendered.stdout)
+        self.assertIn("▱▱▱▱▱▱▱▱▱▱ 0", rendered.stdout)
         self.assertEqual(installed["hooks"], hooks)
         self.assertEqual(installed["env"]["KEEP_ME"], "yes")
         self.assertEqual(installed["model"], "opus")

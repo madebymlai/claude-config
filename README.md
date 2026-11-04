@@ -28,8 +28,9 @@ The one-row Catppuccin Mocha Powerline footer shows:
 - Current directory basename and Git branch when space permits. These disappear
   first on narrower terminals; very narrow terminals use clipped compact text.
 
-Unknown context (before the first response or just after compaction) shows
-`░░░░░░░░░░ ?`. Context colors turn peach at 70% and red at 90%.
+Startup/no usage shows a green empty bar, `▱▱▱▱▱▱▱▱▱▱ 0`, like Pi.
+Nonzero usage with unknown occupancy still shows `░░░░░░░░░░ ?`.
+Context colors turn peach at 70% and red at 90%.
 
 Claude's **native permission-mode indicator remains below this row**. Claude
 2.1.318 does not send the live mode to custom status lines; no hook tracking or

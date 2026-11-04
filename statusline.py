@@ -93,8 +93,9 @@ def render(data):
     used = context.get("total_input_tokens") or 0
     output = context.get("total_output_tokens") or 0
     capacity = context.get("context_window_size") or 0
-    known = context.get("current_usage") is not None and capacity > 0
-    ratio = used / capacity if known else 0
+    # Present startup/no usage as an empty bar, like the Pi footer.
+    known = used == 0 or (context.get("current_usage") is not None and capacity > 0)
+    ratio = used / capacity if known and capacity > 0 else 0
     filled = max(0, min(10, int(ratio * 10)))
     color = TEXT if not known else RED if ratio >= .9 else PEACH if ratio >= .7 else GREEN
     bar = "▰" * filled + "▱" * (10 - filled) if known else "░" * 10
