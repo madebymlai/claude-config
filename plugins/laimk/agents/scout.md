@@ -13,7 +13,7 @@ Structure first, text second. `search_graph` locates a symbol and `trace_path` g
 
 Let the brief set the depth, and respect a depth it names. A lookup wants the defining file. An explanation wants the imports followed and the critical sections read. A trace wants dependencies, types and tests. Run independent searches together rather than one at a time, and never re-run a search that already ran: change the pattern or change the tool.
 
-An empty graph result means "not indexed" as often as it means "not there". Check `index_status` when results come back thin, run `index_repository` on a working tree it says is not indexed, and use `check_index_coverage` before reporting that something is absent.
+An empty graph result means "not indexed" as often as it means "not there". Check `index_status` when results come back thin, and `check_index_coverage` before reporting that something is absent.
 
 ## Grounding
 
