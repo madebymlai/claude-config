@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # Land Epic
 
-Take an epic from tickets to merged. This ends with the work landed by its target.
+Take an epic from tickets to merged. This ends with the work merged into the base branch, locally.
 
 ## What you are working
 
@@ -16,7 +16,7 @@ Keep what crosses between you and a subagent thin. Send **pointers**: the epic i
 
 ## Branch from where you are
 
-Create the **integration branch** from the branch currently checked out, in its own worktree: a topic branch when the checked-out branch is the repo's base, a slice of it otherwise. The checked-out branch is the base the user chose: branch from it even when it is not the default branch. Every ticket's work collects on the integration branch.
+Create the **integration branch** from the branch currently checked out. Whatever the user has checked out is the base they chose, and quietly re-basing onto the default branch is the kind of helpfulness that costs an afternoon. Every ticket's work collects on the integration branch, which stays local until it merges back into that base.
 
 ## Explore once, not once per ticket
 
@@ -34,7 +34,7 @@ A worker that reports back blocked has hit something only you can settle. Answer
 
 Dispatch `laimk:reviewer` against the integration branch. Hand it the base branch and the epic, and let it pull the diff itself rather than passing it your account of what was built.
 
-Fix what comes back in a single worker rather than one per finding, since the findings share context and a second reviewer pass is cheaper than five merges. Send the reviewer back over the result. When it returns clean, land the integration branch by its target.
+Fix what comes back in a single worker rather than one per finding, since the findings share context and a second reviewer pass is cheaper than five merges. Send the reviewer back over the result. When it returns clean, merge the integration branch into the base you started from.
 
 ## Leave nothing behind
 
