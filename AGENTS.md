@@ -1,9 +1,8 @@
-# Istruzioni comuni per i progetti in ~/git
+# Shared instructions for the projects in ~/git
 
 ## Git
 
-Un branch nuovo resta locale. A lavoro finito: merge in locale sul ramo base,
-poi push del ramo base, se non specificato diversamente.
+A new branch stays local. When the work is done, merge it locally into the base branch, then push the base branch, unless told otherwise.
 
 ## bd (beads)
 
@@ -11,13 +10,13 @@ bd (beads) is the issue tracker. Run `bd prime` before the first issue-tracking 
 
 Record a durable insight with `bd remember "insight"`.
 
-Init di un workspace:
+Initialize a workspace with:
 
 ```bash
 bd init --quiet --stealth --skip-hooks --skip-agents --non-interactive
 ```
 
-Mai nominare le issue bd nei commenti, nei nomi dei branch e nei commit.
+Never name bd issues in comments, branch names or commits.
 
 ## Workflow
 
