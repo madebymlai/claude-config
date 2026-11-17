@@ -10,17 +10,23 @@ hits runs two rg searches at once: an ordinary rg walk that also searches
 hidden files and skips only .git, and a search of the tracked files that
 .gitignore hides from a plain rg, whose file lines are tagged
 [tracked, hidden by .gitignore]. Binary files are skipped; submodules and
-nested repositories are searched like any directory.
+nested repositories are searched like any directory. A tracked file that a
+submodule's own .gitignore hides is found only when hits runs inside that
+submodule.
 
 Each match is shown under its owner chain (impl Foo > fn new), with the
 innermost definition's line range. Definitions come from ast-grep's parse of
-the file; a file in a language ast-grep does not parse shows (no parser).
+the file; a file in a language ast-grep does not parse shows (no parser), a
+file it returns no definitions for shows (no definitions found), and a file
+ast-grep failed on shows (ast-grep failed).
 
 RG_FLAGS pass to rg, before or after PATTERN; after -- every token is PATTERN
-or PATH. Examples: -i -w -F -P -U -t java -g '*.rs' -C 2. -E and -n are
-accepted and dropped. -l and -c print one line per file with its match count.
---max N caps the matches printed (default 300); over the cap, hits prints
-counts by directory and file instead.
+or PATH. Examples: -i -w -F -P -U -L -t java -g '*.rs' -C 2, and -E latin1,
+rg's --encoding, for text that is not UTF-8. -n and -N are accepted and
+dropped. With -e PATTERN or -f FILE, every positional is a PATH. -l and -c
+print one line per file with its count of matching lines, --count-matches
+with its count of matches. --max N (or --max=N) caps the matches printed
+(default 300); over the cap, hits prints counts by directory and file instead.
 """
 import base64
 import json
@@ -31,7 +37,6 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter, OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 
 # language: (file extensions, definition node kinds, arrow-function bindings count as definitions)
 LANGUAGES = {
@@ -40,8 +45,8 @@ LANGUAGES = {
     "kotlin": (("kt", "kts",), ("class_declaration", "object_declaration", "function_declaration",), False),
     "python": (("py", "pyi",), ("function_definition", "class_definition",), False),
     "javascript": (("js", "mjs", "cjs", "jsx",), ("function_declaration", "generator_function_declaration", "class_declaration", "method_definition",), True),
-    "typescript": (("ts", "mts", "cts",), ("function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "method_definition", "interface_declaration", "enum_declaration", "module",), True),
-    "tsx": (("tsx",), ("function_declaration", "class_declaration", "abstract_class_declaration", "method_definition", "interface_declaration", "enum_declaration",), True),
+    "typescript": (("ts", "mts", "cts",), ("function_declaration", "generator_function_declaration", "class_declaration", "abstract_class_declaration", "method_definition", "interface_declaration", "enum_declaration", "module", "internal_module",), True),
+    "tsx": (("tsx",), ("function_declaration", "class_declaration", "abstract_class_declaration", "method_definition", "interface_declaration", "enum_declaration", "internal_module",), True),
     "go": (("go",), ("function_declaration", "method_declaration", "type_declaration",), False),
     "csharp": (("cs",), ("namespace_declaration", "class_declaration", "struct_declaration", "interface_declaration", "enum_declaration", "record_declaration", "method_declaration", "constructor_declaration",), False),
     "c": (("c", "h",), ("function_definition", "struct_specifier",), False),
@@ -54,18 +59,23 @@ LANGUAGES = {
     "bash": (("sh", "bash",), ("function_definition",), False),
 }
 LANGUAGE_OF = {ext: lang for lang, (exts, _, _) in LANGUAGES.items() for ext in exts}
+# the child of a definition that holds its name: the name field, a C or C++ function's declarator, and in Kotlin,
+# whose grammar names no fields, the identifier child. A rule naming a field its grammar lacks does not compile.
+NAME_FIELD = ({"field": "name"},)
+NAME_CHILD = {"c": NAME_FIELD + ({"field": "declarator"},), "cpp": NAME_FIELD + ({"field": "declarator"},),
+              "kotlin": ({"any": [{"kind": "simple_identifier"}, {"kind": "type_identifier"}]},)}
 
-SHORT_WITH_VALUE = set("ABCmMtTgefjd")
+SHORT_WITH_VALUE = set("ABCmMtTgefjdE")
 LONG_WITH_VALUE = {"--type", "--type-not", "--type-add", "--type-clear", "--glob", "--iglob", "--after-context",
                    "--before-context", "--context", "--max-count", "--max-columns", "--max-depth", "--max-filesize",
                    "--encoding", "--engine", "--file", "--threads", "--dfa-size-limit", "--regex-size-limit",
                    "--path-separator", "--pre", "--pre-glob", "--context-separator", "--ignore-file", "--color",
                    "--colors", "--sort", "--sortr", "--hyperlink-format", "--field-context-separator",
                    "--field-match-separator"}
-DROPPED = {"-E", "-n", "-r", "-R", "-H", "--extended-regexp", "--line-number", "--recursive", "--color", "--colors",
-           "--sort", "--sortr"}
+DROPPED = {"-n", "-N", "-r", "-R", "-H", "--extended-regexp", "--line-number", "--no-line-number", "--recursive",
+           "--color", "--colors", "--sort", "--sortr"}
 DIGEST = {"-l", "-c", "--files-with-matches", "--count", "--count-matches"}
-REFUSED = {"--files", "-L", "--files-without-match", "--json", "--vimgrep", "-q", "--quiet", "--replace", "--passthru",
+REFUSED = {"--files", "--files-without-match", "--json", "--vimgrep", "-q", "--quiet", "--replace", "--passthru",
            "--stats", "--null", "-0", "--heading", "-p", "--pretty"}
 TAG = "  [tracked, hidden by .gitignore]"
 
@@ -79,10 +89,18 @@ def plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else "es" if word == "match" else "s")
 
 
+def decode(data):
+    """DATA as UTF-8, or as Latin-1 when it is not UTF-8, which keeps every byte as one character."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
 def read_lines(path, cache={}):
     if path not in cache:
         with open(path, "rb") as f:
-            cache[path] = f.read().decode("utf-8", errors="replace").split("\n")
+            cache[path] = decode(f.read()).split("\n")
     return cache[path]
 
 
@@ -97,41 +115,57 @@ def rule(lang):
     any_of = [{"kind": k} for k in kinds]
     if arrow:
         any_of.append({"all": [{"kind": "variable_declarator"}, {"has": {"kind": "arrow_function"}}]})
-    return json.dumps({"id": "def-" + lang, "language": lang, "rule": {"any": any_of}})
+    kind = {"any": any_of}
+    # $NAME captures the name child; a definition without one, such as a Rust impl, matches by its kind alone
+    named = [{"all": [kind, {"has": {**child, "pattern": "$NAME"}}]} for child in NAME_CHILD.get(lang, NAME_FIELD)]
+    return json.dumps({"id": "def-" + lang, "language": lang, "rule": {"any": named + [kind]}})
 
 
 def definitions(files):
-    """{path: [(start, end, signature)]} for every file ast-grep parses; 1-based inclusive lines."""
+    """{path: [(start, end, signature)]} for every file ast-grep parses, None for a file it failed on; 1-based
+    inclusive lines. The signature is the line holding the definition's name, which follows its annotations."""
     parsed = [f for f in files if language(f)]
     defs = {f: [] for f in parsed}
     if not parsed or not shutil.which("ast-grep"):
         return defs, bool(parsed)
     rules = "\n---\n".join(rule(l) for l in sorted({language(f) for f in parsed}))
     with tempfile.TemporaryDirectory() as tmp:
-        # ast-grep skips a file that is not UTF-8, so such a file is parsed from a UTF-8 copy with the same lines
+        # ast-grep skips a file that is not UTF-8 and panics on a name that is not, so such a file is parsed from a
+        # UTF-8 copy with the same lines
         source = {}
         for n, f in enumerate(parsed):
             with open(f, "rb") as fh:
                 data = fh.read()
             try:
                 data.decode("utf-8")
+                os.fsencode(f).decode("utf-8")
                 source[os.path.normpath(f)] = f
             except UnicodeDecodeError:
                 copy = os.path.join(tmp, f"{n}{os.path.splitext(f)[1]}")
                 with open(copy, "w", encoding="utf-8") as out:
-                    out.write(data.decode("latin-1"))
+                    out.write(decode(data))
                 source[os.path.normpath(copy)] = f
         scanned = list(source)
         for i in range(0, len(scanned), 1000):
-            out = subprocess.run(["ast-grep", "scan", "--inline-rules", rules, "--json=stream", *scanned[i:i + 1000]],
-                                 capture_output=True).stdout
-            for raw in out.splitlines():
+            batch = scanned[i:i + 1000]
+            r = subprocess.run(["ast-grep", "scan", "--inline-rules", rules, "--json=stream", "--", *batch],
+                               capture_output=True)
+            for raw in r.stdout.splitlines():
                 m = json.loads(raw)
                 path = os.path.normpath(source.get(os.path.normpath(m["file"]), m["file"]))
                 start, end = m["range"]["start"]["line"] + 1, m["range"]["end"]["line"] + 1
-                defs.setdefault(path, []).append((start, end, read_lines(path)[start - 1].strip()))
+                name = m.get("metaVariables", {}).get("single", {}).get("NAME")
+                label = name["range"]["start"]["line"] + 1 if name else start
+                defs.setdefault(path, []).append((start, end, read_lines(path)[label - 1].strip()))
+            if r.returncode != 0:
+                why = next((l for l in r.stderr.decode(errors="replace").splitlines() if l.strip()), "")
+                print(f"explore: ast-grep exited with {r.returncode}: {why}", file=sys.stderr)
+                for f in batch:
+                    if not defs[os.path.normpath(source[f])]:
+                        defs[os.path.normpath(source[f])] = None
     for f in defs:
-        defs[f].sort(key=lambda d: (d[0], -d[1]))
+        if defs[f]:
+            defs[f].sort(key=lambda d: (d[0], -d[1]))
     return defs, False
 
 
@@ -143,6 +177,10 @@ def owner_chain(defs, line):
 def heading(path, line, defs):
     if path not in defs:
         return "(no parser)"
+    if defs[path] is None:
+        return "(ast-grep failed)"
+    if not defs[path]:
+        return "(no definitions found)"
     chain = owner_chain(defs[path], line)
     if not chain:
         return "(top level)"
@@ -154,41 +192,49 @@ def heading(path, line, defs):
 # ---- searching, with rg ---------------------------------------------------------------------
 
 def parse_hits_args(argv):
-    cap = 300
-    if "--max" in argv:
-        i = argv.index("--max")
-        if i + 1 >= len(argv) or not argv[i + 1].isdigit():
-            die("--max takes a number")
-        cap, argv = int(argv[i + 1]), argv[:i] + argv[i + 2:]
-    flags, positional, patterns, it, literal = [], [], [], iter(argv), False
+    """(cap, rg flags, patterns, paths, digest), where digest is the field of rg's end stats that -l, -c or
+    --count-matches prints per file, or None without them."""
+    cap, flags, positional, patterns, it, literal, from_file = 300, [], [], [], iter(argv), False, False
     try:
         for tok in it:
-            name = tok.split("=", 1)[0]
+            name, eq, value = tok.partition("=")
             if literal or not tok.startswith("-") or tok == "-":
                 positional.append(tok)
             elif tok == "--":
                 literal = True
-            elif tok in ("-e", "--regexp"):
-                patterns.append(next(it))
+            elif name == "--max":
+                value = value if eq else next(it)
+                if not value.isdigit():
+                    die("--max takes a number")
+                cap = int(value)
+            elif name == "--regexp":
+                patterns.append(value if eq else next(it))
+            elif name == "--file":
+                flags += ["--file", value if eq else next(it)]
+                from_file = True
             elif name in REFUSED:
                 die(f"{name} is not supported by hits; run rg directly for it")
             elif tok.startswith("--"):
-                value = [next(it)] if name in LONG_WITH_VALUE and "=" not in tok else []
+                value = [next(it)] if name in LONG_WITH_VALUE and not eq else []
                 if name not in DROPPED:
                     flags += [tok] + value
-            elif tok[1] in SHORT_WITH_VALUE and len(tok) > 2:
-                flags.append(tok)  # a value glued to its flag: -A2, -tjava
             else:
-                for i, ch in enumerate(tok[1:]):  # a cluster such as -inw or -En
+                for i, ch in enumerate(tok[1:]):  # a cluster such as -inw, whose last flag may take a value: -A2, -ie PAT
                     if "-" + ch in DROPPED:
                         continue
                     if ch in SHORT_WITH_VALUE:
-                        flags += ["-" + ch, tok[i + 2:] or next(it)]
+                        value = tok[i + 2:] or next(it)
+                        if ch == "e":
+                            patterns.append(value)
+                        else:
+                            flags += ["-" + ch, value]
+                            from_file |= ch == "f"
                         break
                     flags.append("-" + ch)
     except StopIteration:
         die("a flag is missing its value")
-    if not patterns:  # as in rg: with no -e the first positional is the pattern, with -e every positional is a path
+    # as in rg: with no -e or -f the first positional is the pattern, with either every positional is a path
+    if not patterns and not from_file:
         if not positional:
             die("usage: explore hits [RG_FLAGS] PATTERN [PATH...]   (a PATTERN starting with '-' goes after -e)")
         patterns, positional = positional[:1], positional[1:]
@@ -196,7 +242,8 @@ def parse_hits_args(argv):
     for p in paths:
         if not os.path.exists(p):
             die(f"no such path: {p}")
-    return cap, [f for f in flags if f not in DIGEST], patterns, paths, any(f in DIGEST for f in flags)
+    digest = ("matches" if "--count-matches" in flags else "matched_lines") if any(f in DIGEST for f in flags) else None
+    return cap, [f for f in flags if f not in DIGEST], patterns, paths, digest
 
 
 def git_top():
@@ -213,74 +260,95 @@ def hidden_tracked(paths, top):
 
 
 def roots(files):
-    """The fewest directories that hold FILES."""
-    out = []
-    for d in sorted({os.path.dirname(f) or "." for f in files}):
-        if not out or not (d + os.sep).startswith(out[-1] + os.sep):
-            out.append(d)
-    return out
+    """The directories that directly hold FILES."""
+    return sorted({os.path.dirname(f) or "." for f in files})
 
 
-def rg(args):
-    r = subprocess.run(["rg", "--json", "--no-config", *args], capture_output=True)
-    return r.returncode, r.stdout, r.stderr.decode(errors="replace")
+def rg_command(args):
+    return ["rg", "--json", "--no-config", *args]
 
 
-def text_of(field):
-    return field["text"] if "text" in field else base64.b64decode(field["bytes"]).decode("utf-8", errors="replace")
+def text_of(field, start=0):
+    """The text of an rg JSON field, and the character column of byte offset START in it."""
+    raw = field["text"].encode() if "text" in field else base64.b64decode(field["bytes"])
+    try:
+        return raw.decode("utf-8"), len(raw[:start].decode("utf-8", errors="ignore"))
+    except UnicodeDecodeError:
+        return raw.decode("latin-1"), start
 
 
-def events(stdout, keep=None):
-    rows, searched = [], 0
+def path_of(field):
+    """An rg JSON path, relative to the working directory however it was given."""
+    path = field["text"] if "text" in field else os.fsdecode(base64.b64decode(field["bytes"]))
+    return os.path.normpath(os.path.relpath(path) if os.path.isabs(path) else path)
+
+
+def events(stdout, keep, cap, count, per_file, rows):
+    """Read rg's JSON output into PER_FILE, {path: COUNT field of its end stats}, and ROWS, a set of
+    (path, line, text, is_match, column), decoding match and context rows only until ROWS holds more than CAP
+    matches. KEEP, when given, limits both to its paths. Returns the number of files searched."""
+    searched, matches = 0, sum(r[3] for r in rows)
     for raw in stdout.splitlines():
-        if raw.endswith(b'"type":"summary"}'):
+        if raw.startswith(b'{"type":"end"'):
+            d = json.loads(raw)["data"]
+            path = path_of(d["path"])
+            if (keep is None or path in keep) and d["stats"][count]:
+                per_file[path] = d["stats"][count]
+        elif raw.endswith(b'"type":"summary"}'):
             searched += json.loads(raw)["data"]["stats"]["searches"]
-        elif raw.startswith(b'{"type":"match"') or raw.startswith(b'{"type":"context"'):
+        elif matches <= cap and (raw.startswith(b'{"type":"match"') or raw.startswith(b'{"type":"context"')):
             ev = json.loads(raw)
-            d = ev["data"]
-            path = os.path.normpath(d["path"]["text"] if "text" in d["path"] else os.fsdecode(base64.b64decode(d["path"]["bytes"])))
+            d, is_match = ev["data"], ev["type"] == "match"
+            path = path_of(d["path"])
             if keep is None or path in keep:
-                rows.append((path, d["line_number"], text_of(d["lines"]).rstrip("\n").split("\n")[0], ev["type"] == "match"))
-    return rows, searched
+                text, column = text_of(d["lines"], d["submatches"][0]["start"] if is_match and d["submatches"] else 0)
+                row = (path, d["line_number"], text.rstrip("\n").split("\n")[0], is_match, column)
+                matches += is_match and row not in rows
+                rows.add(row)
+    return searched
 
 
-def search(flags, patterns, paths):
+def search(flags, patterns, paths, cap, count):
+    """({path: count}, rows, files searched, rg errors, tracked files .gitignore hides); see events."""
     top = git_top()
     regexps = [a for p in patterns for a in ("-e", p)]
-    walk = ["--hidden", "--no-ignore-dot", "--no-ignore-parent", "-g", "!.git", *flags, *regexps, "--", *paths]
-    with ThreadPoolExecutor(2) as pool:
-        first = pool.submit(rg, walk)
-        hidden = hidden_tracked(paths, top) if top else set()
-        second = rg(["--no-ignore", "--hidden", *flags, *regexps, "--", *roots(hidden)]) if hidden else None
-        results = [first.result()] + ([second] if second else [])
-    rows, searched, errors = [], 0, []
+    walk = ["--hidden", "--no-ignore-dot", "-g", "!.git", *flags, *regexps, "--", *paths]
+    first = subprocess.Popen(rg_command(walk), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    hidden = hidden_tracked(paths, top) if top else set()
+    results = []
+    if hidden:
+        second = ["--no-ignore", "--hidden", *flags, "--max-depth", "1", *regexps, "--", *roots(hidden)]
+        r = subprocess.run(rg_command(second), capture_output=True)
+        results.append((r.returncode, r.stdout, r.stderr))
+    out, err = first.communicate()
+    results.insert(0, (first.returncode, out, err))
+    per_file, rows, searched, errors = {}, set(), 0, []
     for k, (code, out, err) in enumerate(results):
-        r, s = events(out, keep=hidden if k == 1 else None)
-        rows += r
+        s = events(out, hidden if k == 1 else None, cap, count, per_file, rows)
         searched += s if k == 0 else 0
         if code == 2:
-            errors += [e for e in err.splitlines() if e.strip()]
-    return sorted(set(rows), key=lambda r: (r[0], r[1])), searched, errors, hidden
+            errors += [e for e in err.decode(errors="replace").splitlines() if e.strip()]
+    return dict(sorted(per_file.items())), sorted(rows, key=lambda r: (r[0], r[1])), searched, errors, hidden
 
 
 def hits(argv):
     cap, flags, patterns, paths, digest = parse_hits_args(argv)
-    rows, searched, errors, hidden = search(flags, patterns, paths)
-    matches = [r for r in rows if r[3]]
+    per_file, rows, searched, errors, hidden = search(flags, patterns, paths, -1 if digest else cap,
+                                                       digest or "matched_lines")
+    total = sum(per_file.values())
     tag = lambda p: TAG if p in hidden else ""
-    if not matches:
+    if not total:
         if errors:
             die("\n".join(errors[:5]))
         if searched == 0 and not hidden:
             die("searched 0 files; check the PATH arguments and the working directory")
         print(f"0 matches in {plural(searched, 'file')} searched")
         return
-    per_file = Counter(r[0] for r in matches)
     if digest:
         for path in sorted(per_file):
             print(f"{per_file[path]:>6}  {path}{tag(path)}")
-    elif len(matches) > cap:
-        print(f"{plural(len(matches), 'match')} in {plural(len(per_file), 'file')}, over the cap of {cap}: "
+    elif total > cap:
+        print(f"{plural(total, 'match')} in {plural(len(per_file), 'file')}, over the cap of {cap}: "
               "counts below. Narrow with PATH, -t or -g, or raise --max.")
         per_dir = Counter()
         for path, n in per_file.items():
@@ -289,35 +357,50 @@ def hits(argv):
         for d, n in per_dir.most_common(20):
             print(f"  {n:>6}  {d}/")
         print("by file:")
-        for p, n in per_file.most_common(20):
+        for p, n in Counter(per_file).most_common(20):
             print(f"  {n:>6}  {p}{tag(p)}")
     else:
-        print_grouped(rows, matches, per_file, tag)
+        print_grouped(rows, tag)
     if errors:
         print(f"rg reported {plural(len(errors), 'error')}; the results above cover the other files:")
         for e in errors[:5]:
             print("  " + e)
 
 
-def print_grouped(rows, matches, per_file, tag):
-    defs, no_parser = definitions(sorted(per_file))
+def clip(text, column, width=160):
+    """WIDTH characters of TEXT around COLUMN, with ... where the line is cut."""
+    if len(text) <= width:
+        return text
+    start = max(0, min(column - width // 4, len(text) - width))
+    return ("..." if start else "") + text[start:start + width] + ("..." if start + width < len(text) else "")
+
+
+def print_grouped(rows, tag):
+    matches = [r for r in rows if r[3]]
+    files = sorted({r[0] for r in matches})
+    defs, no_parser = definitions(files)
     if no_parser:
         print("explore: ast-grep is not installed, so matches show no enclosing definition", file=sys.stderr)
-    heads = {(p, n): heading(p, n, defs) for p, n, _, _ in matches}
+    heads = {(p, n): heading(p, n, defs) for p, n, _, _, _ in matches}
     match_lines = {}
     for p, n in heads:
         match_lines.setdefault(p, []).append(n)
     tree = OrderedDict()
-    for path, num, text, is_match in rows:
+    for path, num, text, is_match, column in rows:
         anchor = num if is_match else min(match_lines[path], key=lambda m: (abs(m - num), m < num))
-        tree.setdefault(path, OrderedDict()).setdefault(heads[(path, anchor)], []).append((num, text.strip(), is_match))
-    print(f"{plural(len(matches), 'match')} in {plural(len(per_file), 'file')}")
+        tree.setdefault(path, OrderedDict()).setdefault(heads[(path, anchor)], []).append((num, text, is_match, column))
+    # with context lines a group keeps its relative indentation, so a line shows which block it sits in
+    context = len(matches) < len(rows)
+    print(f"{plural(len(matches), 'match')} in {plural(len(files), 'file')}")
     for path, groups in tree.items():
         print(path + tag(path))
         for head, ms in groups.items():
             print(f"  {head}")
-            for num, text, is_match in ms:
-                print(f"  {num:>6}{':' if is_match else '-'}   {text[:160]}")
+            if context:
+                indent = len(os.path.commonprefix([t[:len(t) - len(t.lstrip())] for _, t, _, _ in ms if t.strip()]))
+            for num, text, is_match, column in ms:
+                cut = indent if context else len(text) - len(text.lstrip())
+                print(f"  {num:>6}{':' if is_match else '-'}   {clip(text.rstrip()[cut:], column - cut)}")
 
 
 # ---- reading ---------------------------------------------------------------------------------
@@ -334,6 +417,9 @@ def outline(files):
         if path not in defs:
             print(f"{path}: (no parser)")
             continue
+        if not defs[path]:
+            print(f"{path}: {'(ast-grep failed)' if defs[path] is None else '(no definitions found)'}")
+            continue
         print(path)
         stack = []
         for start, end, sig in defs[path]:
@@ -346,17 +432,22 @@ def outline(files):
 
 
 def show(argv):
-    windows = []
-    if len(argv) >= 2 and ":" not in argv[0] and argv[1].isdigit():
-        start = int(argv[1])
-        windows.append((argv[0], start, int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else start + 59))
-    else:
-        for spec in argv:
-            m = re.match(r"^(.*?):(\d+)(?:[-:,](\d+))?$", spec)
-            if not m:
-                die(f"show takes FILE:LINE, FILE:START-END or FILE START [END], not {spec!r}")
-            line = int(m.group(2))
-            windows.append((m.group(1), line, int(m.group(3))) if m.group(3) else (m.group(1), max(1, line - 10), line + 20))
+    windows, rest = [], list(argv)
+    while rest:
+        if len(rest) >= 2 and ":" not in rest[0] and rest[1].isdigit():  # FILE START [END]
+            start, has_end = int(rest[1]), len(rest) > 2 and rest[2].isdigit()
+            windows.append((rest[0], start, int(rest[2]) if has_end else start + 59))
+            rest = rest[3 if has_end else 2:]
+            continue
+        spec = rest.pop(0)
+        m = re.match(r"^(.*?):(\d+)(?:([-,:])(\d+))?$", spec)
+        if not m:
+            die(f"show takes FILE:LINE, FILE:START-END or FILE START [END], not {spec!r}")
+        path, line, sep, b = m.group(1), int(m.group(2)), m.group(3), m.group(4)
+        if b and (sep != ":" or int(b) >= line):
+            windows.append((path, line, int(b)))
+        else:  # FILE:LINE, or FILE:LINE:COL as compilers print it
+            windows.append((path, max(1, line - 10), line + 20))
     if not windows:
         die("show takes FILE:LINE, FILE:START-END or FILE START [END]")
     failed = 0
@@ -367,9 +458,13 @@ def show(argv):
             print(f"{path}: {e.strerror}")
             failed += 1
             continue
+        count = len(lines) - (lines[-1] == "")  # a final newline ends the last line rather than starting one
+        if max(start, 1) > min(end, count):
+            print(f"{path} has {plural(count, 'line')}")
+            continue
         if len(windows) > 1:
             print(f"== {path}:{start}-{end}")
-        for n in range(max(start, 1), min(end, len(lines)) + 1):
+        for n in range(max(start, 1), min(end, count) + 1):
             print(f"{n:>6}  {lines[n - 1]}")
     if failed:
         sys.exit(1)
