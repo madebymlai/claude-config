@@ -1,0 +1,3 @@
+[env]
+# link PCRE2 into the binary from pcre2-sys's bundled source, so a prebuilt explore-rust needs no libpcre2 on the host
+PCRE2_SYS_STATIC = "1"
