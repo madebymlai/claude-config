@@ -45,16 +45,22 @@ null when it has none (a Rust impl is named by its type). A skip is
            total and files as the header counts them; counts is {path: n} for
            every file when the text prints counts (-l, -c, --count-matches, or
            over the cap), else null. rows lists the matches, when the text does:
-           {file, line, text, owners: [def, outermost first], hidden, ctx}, with
-           text the whole line and ctx the -A/-B/-C lines grouped with it,
-           [{line, text}]. hidden lists the matched files tagged hidden, errors
-           all of rg's errors.
+           {file, line, text, owners: [def, outermost first], subs, hidden,
+           ctx}, with text the whole line and ctx the -A/-B/-C lines grouped
+           with it, [{line, text}]. subs has one {col, end, in} per match on
+           the line: 0-based character columns (under -U a match may run on
+           into the lines below, its columns counting their newlines), and in,
+           where the match starts: "code", "comment" or "string", or null when
+           ast-grep did not parse the file, or a warning says its lines are too
+           long to place matches in. hidden lists the matched files tagged
+           hidden, errors all of rg's errors.
   outline: {files: [{file, defs: [def + depth]}], skips, missing}
            missing lists the FILE arguments that are not files.
 warnings (both) holds what text mode writes to stderr, so a --json run that
 succeeds writes only the document and exits 0. An error exits nonzero with
 its message on stderr and no document, as in text.
 """
+import codecs
 import json
 import os
 import re
@@ -80,6 +86,7 @@ class Field(msgspec.Struct, gc=False):  # rg's text, or its bytes when they are 
 
 class Submatch(msgspec.Struct, gc=False):
     start: int
+    end: int
 
 
 class Stats(msgspec.Struct, gc=False):
@@ -193,6 +200,42 @@ TYPE_CHILD = {"rust": {"field": "type"}}
 ARROW = "variable_declarator"  # the kind of an arrow-function binding
 Def = namedtuple("Def", "start end sig kind name")
 
+
+def places(comment="", string="", code=""):
+    """{node kind: place} for the kinds named in each, space-separated."""
+    return {k: place for place, kinds in (("comment", comment), ("string", string), ("code", code)) for k in kinds.split()}
+
+
+# language: the node kinds a match sits in when it is in a comment or a string; a match in none sits in code, and so
+# does one in a kind that puts code back inside a string, such as an interpolation
+PLACES = {
+    "rust": places("line_comment block_comment", "string_literal raw_string_literal char_literal"),
+    "java": places("line_comment block_comment", "string_literal character_literal", "string_interpolation"),
+    "kotlin": places("line_comment multiline_comment", "string_literal character_literal",
+                     "interpolated_expression interpolated_identifier"),
+    "python": places("comment", "string", "interpolation"),
+    "javascript": places("comment html_comment", "string template_string regex jsx_text", "template_substitution"),
+    "typescript": places("comment", "string template_string regex", "template_substitution"),
+    "tsx": places("comment", "string template_string regex jsx_text", "template_substitution"),
+    "go": places("comment", "interpreted_string_literal raw_string_literal rune_literal"),
+    "csharp": places("comment", "string_literal verbatim_string_literal raw_string_literal interpolated_string_expression "
+                     "character_literal", "interpolation"),
+    "c": places("comment", "string_literal char_literal system_lib_string"),
+    "cpp": places("comment", "string_literal char_literal raw_string_literal system_lib_string"),
+    "ruby": places("comment", "string heredoc_body regex character subshell delimited_symbol string_array", "interpolation"),
+    "php": places("comment", "string encapsed_string heredoc nowdoc"),
+    "swift": places("comment multiline_comment", "line_string_literal multi_line_string_literal raw_string_literal",
+                    "interpolated_expression"),
+    "scala": places("comment block_comment", "string interpolated_string interpolated_string_expression character_literal",
+                    "interpolation"),
+    "lua": places("comment", "string"),
+    "bash": places("comment", "string raw_string ansi_c_string heredoc_body",
+                   "command_substitution expansion simple_expansion"),
+}
+# ast-grep prints each node with its whole lines, so a file's comments and strings cost about the number on each line
+# times its length; a file over this, such as a minified bundle, is parsed without them
+PLACE_BUDGET = 64 << 20
+
 SHORT_WITH_VALUE = set("ABCmMtTgefjdE")
 LONG_WITH_VALUE = {"--type", "--type-not", "--type-add", "--type-clear", "--glob", "--iglob", "--after-context",
                    "--before-context", "--context", "--max-count", "--max-columns", "--max-depth", "--max-filesize",
@@ -262,6 +305,22 @@ def rules(lang):
         yield json.dumps({"id": f"def-{lang}-{k}", "language": lang, "rule": {"any": named + [kind]}})
 
 
+def place_rules(lang):
+    """ast-grep's rules for LANG's comments and strings, each with its id: in-LANG-KIND."""
+    for k in PLACES[lang]:
+        yield json.dumps({"id": f"in-{lang}-{k}", "language": lang, "rule": {"kind": k}})
+
+
+def place_cost(data):
+    """About how many bytes ast-grep prints for DATA's comments and strings, at most: each line's length times its
+    delimiters, a line up to 128 characters counted as 128 long, so only the longer lines are visited."""
+    delimiters = lambda b: (b.count(b'"') + b.count(b"'") + b.count(b"`")) // 2 + b.count(b"//") + b.count(b"/*") \
+        + b.count(b"#") + b.count(b"--")
+    long = [l for l in data.split(b"\n") if len(l) > 128]
+    in_long = [delimiters(l) for l in long]
+    return sum(len(l) * n for l, n in zip(long, in_long)) + 128 * max(0, delimiters(data) - sum(in_long))
+
+
 def name_of(lang, path, var):
     """The name a definition's $NAME or $TYPE capture VAR holds, read from PATH by VAR's range, whose columns count
     characters, so that a copy ast-grep parsed in its place gives the original's text; a C or C++ function's
@@ -276,22 +335,25 @@ def name_of(lang, path, var):
     return text
 
 
-def definitions(files):
-    """{path: [Def]} for every file ast-grep parses, and for a file it did not parse the reason, such as
+def definitions(files, placed=False):
+    """({path: [Def]} for every file ast-grep parses, and for a file it did not parse the reason, such as
     "ast-grep failed" or "ast-grep skipped: fileTooLarge"; 1-based inclusive lines. The signature is the line holding
     the definition's name, which follows its annotations; the kind is its node kind, and the name is None for a
-    definition with neither a name child nor a type child."""
+    definition with neither a name child nor a type child. Then whether ast-grep is missing, and with PLACED the
+    comments and strings of each file it parsed with them, {path: {line: [(start line, start column, end line,
+    end column, place)]}}, 0-based, columns in characters, each node listed under every line it spans.)"""
     parsed = [f for f in files if language(f)]
-    defs = {f: [] for f in parsed}
+    defs, where = {f: [] for f in parsed}, {}
     if not parsed or not shutil.which("ast-grep"):
-        return defs, bool(parsed)
+        return defs, bool(parsed), where
     langs = sorted({language(f) for f in parsed})
-    joined = "\n---\n".join(r for l in langs for r in rules(l))
+    plain = "\n---\n".join(r for l in langs for r in rules(l))
+    joined = "\n---\n".join([plain, *(r for l in langs for r in place_rules(l))]) if placed else plain
     with tempfile.TemporaryDirectory() as tmp:
         # ast-grep skips a file that is not UTF-8 and panics on a name that is not, and drops a definition that an
         # ast-grep-ignore comment suppresses, even under --inline-rules, so such a file is parsed from a UTF-8 copy
         # with the same lines, whose comments read ast-grep-IGNORE, which ast-grep does not honour
-        source = {}
+        source, costly = {}, set()
         for n, f in enumerate(parsed):
             try:
                 with open(f, "rb") as fh:
@@ -299,6 +361,9 @@ def definitions(files):
             except OSError:  # ast-grep cannot read it either, and reports why
                 source[os.path.normpath(f)] = f
                 continue
+            if placed and place_cost(data) > PLACE_BUDGET:
+                costly.add(os.path.normpath(f))
+                warn(f"{f}: lines too long to place its matches in code, comments or strings; its subs show in: null")
             try:
                 data.decode("utf-8")
                 os.fsencode(f).decode("utf-8")
@@ -311,14 +376,30 @@ def definitions(files):
             with open(copy, "w", encoding="utf-8") as out:
                 out.write(decode(data).replace("ast-grep-ignore", "ast-grep-IGNORE"))
             source[os.path.normpath(copy)] = f
-        scanned = list(source)
-        for i in range(0, len(scanned), 1000):
-            batch = scanned[i:i + 1000]
-            r = subprocess.run(["ast-grep", "scan", "--inline-rules", joined, "--json=stream", "--inspect", "entity",
-                                "--", *batch], capture_output=True)
+        cheap = [f for f in source if os.path.normpath(source[f]) not in costly]
+        batches = [(cheap[i:i + 1000], placed) for i in range(0, len(cheap), 1000)]
+        batches += [([f for f in source if os.path.normpath(source[f]) in costly], False)] if costly else []
+        for batch, with_places in batches:
+            r = subprocess.run(["ast-grep", "scan", "--inline-rules", joined if with_places else plain, "--json=stream",
+                                "--inspect", "entity", "--", *batch], capture_output=True)
+            for f in batch if with_places else ():
+                where[os.path.normpath(source[f])] = {}
+            originals, place_of = {}, {}  # each file ast-grep names, and each place rule's place
             for m in SG.decode_lines(r.stdout):
-                path = os.path.normpath(source.get(os.path.normpath(m.file), m.file))
-                rng, single = m.range, m.metaVariables.single if m.metaVariables else Captures()
+                path = originals.get(m.file)
+                if path is None:
+                    path = originals[m.file] = os.path.normpath(source.get(os.path.normpath(m.file), m.file))
+                rng = m.range
+                if m.ruleId.startswith("in-"):
+                    where_in = place_of.get(m.ruleId)
+                    if where_in is None:
+                        lang, kind = m.ruleId[len("in-"):].split("-", 1)
+                        where_in = place_of[m.ruleId] = PLACES[lang][kind]
+                    node = (rng.start.line, rng.start.column, rng.end.line, rng.end.column, where_in)
+                    for line in range(rng.start.line, rng.end.line + 1):
+                        where[path].setdefault(line, []).append(node)
+                    continue
+                single = m.metaVariables.single if m.metaVariables else Captures()
                 start, end = rng.start.line + 1, rng.end.line + 1
                 name, other = single.NAME, single.TYPE
                 label = name.range.start.line + 1 if name else start
@@ -350,7 +431,7 @@ def definitions(files):
     for f in defs:
         if isinstance(defs[f], list):
             defs[f] = [d[-1] for d in sorted(defs[f], key=lambda d: d[:4])]
-    return defs, False
+    return defs, False, {f: w for f, w in where.items() if isinstance(defs.get(f), list)}
 
 
 def owner_chain(defs, line):
@@ -485,13 +566,30 @@ def rg_json(args):
                             stderr=err), err
 
 
-def text_of(field, start=0):
-    """The text of an rg JSON field, and the character column of byte offset START in it."""
+def text_of(field, offsets=()):
+    """The text of an rg JSON field, and the character column of each byte offset in OFFSETS, ascending."""
     raw = field.text.encode() if field.text is not None else field.raw
     try:
-        return raw.decode("utf-8"), len(raw[:start].decode("utf-8", errors="ignore"))
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return raw.decode("latin-1"), start
+        return raw.decode("latin-1"), list(offsets)
+    # one pass over the bytes: the decoder holds back a character an offset splits, as decoding up to it would drop it
+    decoder, columns, n, last = codecs.getincrementaldecoder("utf-8")(errors="ignore"), [], 0, 0
+    for offset in offsets:
+        n += len(decoder.decode(raw[last:offset]))
+        columns.append(n)
+        last = offset
+    return text, columns
+
+
+def submatches(text, columns):
+    """The (column, end, lines below the first, column in its line) of each submatch, from the character columns of
+    its start and end in TEXT, which spans several lines in a multiline search."""
+    out = []
+    for col, end in zip(columns[::2], columns[1::2]):
+        below = text.count("\n", 0, col)
+        out.append((col, end, below, col - text.rfind("\n", 0, col) - 1 if below else col))
+    return tuple(out)
 
 
 def path_of(field):
@@ -502,7 +600,7 @@ def path_of(field):
 
 def events(stdout, keep, cap, count, per_file, rows):
     """Read rg's JSON output from the pipe STDOUT as it arrives into PER_FILE, {path: COUNT field of its end stats},
-    and ROWS, a set of (path, line, text, is_match, column), decoding match and context rows only until ROWS holds
+    and ROWS, a set of (path, line, text, is_match, submatches), decoding match and context rows only until ROWS holds
     more than CAP matches, so that memory follows what is kept rather than what rg prints. KEEP, when given, limits
     both to its paths. Returns the number of files searched."""
     searched, matches = 0, sum(r[3] for r in rows)
@@ -520,8 +618,9 @@ def events(stdout, keep, cap, count, per_file, rows):
             d, is_match = ev.data, isinstance(ev, Match)
             path = path_of(d.path)
             if keep is None or path in keep:
-                text, column = text_of(d.lines, d.submatches[0].start if is_match and d.submatches else 0)
-                row = (path, d.line_number, text.rstrip("\n").split("\n")[0], is_match, column)
+                # rg lists a line's submatches in order, so their offsets ascend
+                text, columns = text_of(d.lines, [o for m in d.submatches for o in (m.start, m.end)] if is_match else ())
+                row = (path, d.line_number, text.rstrip("\n").split("\n")[0], is_match, submatches(text, columns))
                 matches += is_match and row not in rows
                 rows.add(row)
     return searched
@@ -561,13 +660,13 @@ def hits(argv):
         if searched == 0 and not hidden:
             die("searched 0 files; check the PATH arguments and the working directory")
     listed = total and not digest and total <= cap
-    defs, anchors = owners(rows) if listed else ({}, [])
+    defs, anchors, where = owners(rows, as_json) if listed else ({}, [], {})
     if as_json:
         files = sorted({r[0] for r in rows if r[3]})
         print_json({"total": sum(r[3] for r in rows) if listed else total, "files": len(files) if listed else len(per_file),
                     "searched": searched, "cap": cap, "over": not digest and total > cap,
                     "counts": per_file if total and not listed else None,
-                    "rows": match_rows(rows, anchors, defs, hidden) if listed else [],
+                    "rows": match_rows(rows, anchors, defs, where, hidden) if listed else [],
                     "skips": skips(files, defs) if listed else [],
                     "hidden": [p for p in per_file if p in hidden], "errors": errors, "warnings": WARNINGS})
         return
@@ -605,27 +704,40 @@ def clip(text, column, width=160):
     return ("..." if start else "") + text[start:start + width] + ("..." if start + width < len(text) else "")
 
 
-def owners(rows):
-    """The definitions of the files ROWS holds matches in, as definitions gives them, and for each row the line of
-    the match it belongs to: a match's own line, and a context line's nearest match in its file, the later on a tie."""
+def owners(rows, placed=False):
+    """The definitions of the files ROWS holds matches in, as definitions gives them, for each row the line of the
+    match it belongs to: a match's own line, and a context line's nearest match in its file, the later on a tie; and
+    with PLACED the files' comments and strings, as definitions gives them."""
     matches = [r for r in rows if r[3]]
-    defs, no_parser = definitions(sorted({r[0] for r in matches}))
+    defs, no_parser, where = definitions(sorted({r[0] for r in matches}), placed)
     if no_parser:
         warn("ast-grep is not installed, so matches show no enclosing definition")
     match_lines = {}
     for p, n, _, _, _ in matches:
         match_lines.setdefault(p, []).append(n)
     return defs, [num if is_match else min(match_lines[path], key=lambda m: (abs(m - num), m < num))
-                  for path, num, _, is_match, _ in rows]
+                  for path, num, _, is_match, _ in rows], where
 
 
-def match_rows(rows, anchors, defs, hidden):
-    """The JSON row of each match in ROWS, with its owner chain and the context lines that belong to it."""
+def place(nodes, line, col):
+    """Where a character at 0-based LINE and COL sits among a file's comments and strings NODES on that line: in the
+    innermost that holds it, the one starting last, else in code."""
+    held = [n for n in nodes if (n[0], n[1]) <= (line, col) < (n[2], n[3])]
+    return max(held, key=lambda n: (n[0], n[1], -n[2], -n[3]))[4] if held else "code"
+
+
+def match_rows(rows, anchors, defs, where, hidden):
+    """The JSON row of each match in ROWS, with its owner chain, its submatches placed by WHERE, and the context lines
+    that belong to it."""
     out = {}
-    for path, num, text, is_match, _ in rows:
+    for path, num, text, is_match, subs in rows:
         if is_match:
             chain = owner_chain(defs[path], num) if isinstance(defs.get(path), list) else []
+            nodes = where.get(path)
             out[path, num] = {"file": path, "line": num, "text": text, "owners": [d._asdict() for d in chain],
+                              "subs": [{"col": col, "end": end,
+                                        "in": None if nodes is None else place(nodes.get(num - 1 + below, ()), num - 1 + below, at)}
+                                       for col, end, below, at in subs],
                               "hidden": path in hidden, "ctx": []}
     for (path, num, text, is_match, _), anchor in zip(rows, anchors):
         if not is_match:
@@ -656,7 +768,8 @@ def print_grouped(rows, defs, anchors, tag):
     files = sorted({r[0] for r in matches})
     heads = {(p, n): heading(p, n, defs) for p, n, _, _, _ in matches}
     tree = OrderedDict()
-    for (path, num, text, is_match, column), anchor in zip(rows, anchors):
+    for (path, num, text, is_match, subs), anchor in zip(rows, anchors):
+        column = subs[0][0] if subs else 0
         tree.setdefault(path, OrderedDict()).setdefault(heads[(path, anchor)], []).append((num, text, is_match, column))
     # with context lines a group keeps its relative indentation, so a line shows which block it sits in
     context = len(matches) < len(rows)
@@ -692,7 +805,7 @@ def outline(argv):
         for f in missing:
             print(f"{f}: no such file")
     present = [os.path.normpath(f) for f in files if os.path.isfile(f)]
-    defs, no_parser = definitions(present)
+    defs, no_parser, _ = definitions(present)
     if no_parser:
         die("outline needs ast-grep, which is not installed")
     if as_json:
@@ -787,7 +900,9 @@ def print_json(doc):
 
 def main():
     sys.stdout.reconfigure(errors="backslashreplace")
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    args = sys.argv[1:]
+    # -h or --help anywhere before a -- asks for this help, whichever command it follows
+    if not args or {"-h", "--help"} & set(args[:args.index("--")] if "--" in args else args):
         print(__doc__.strip())
         return
     commands = {"hits": hits, "outline": outline, "show": show}
