@@ -68,8 +68,11 @@ null when it has none (a Rust impl is named by its type). A skip is
            text the whole line and ctx the -A/-B/-C lines grouped with it,
            [{line, text}]. hidden lists the matched files tagged hidden, errors
            all of rg's errors.
-  outline: {files: [{file, defs: [def + depth]}], skips}
-An error exits nonzero with its message on stderr, as in text.";
+  outline: {files: [{file, defs: [def + depth]}], skips, missing}
+           missing lists the FILE arguments that are not files.
+warnings (both) holds what text mode writes to stderr, so a --json run that
+succeeds writes only the document and exits 0. An error exits nonzero with
+its message on stderr and no document, as in text.";
 
 /// Print MSG as explore's error and exit with status 2.
 pub fn die(msg: &str) -> ! {
@@ -153,11 +156,6 @@ fn outline(files: Vec<OsString>, out: &mut Out) {
     let (mut lines, mut defs) = (Lines::default(), Definitions::new());
     let present: Vec<Vec<u8>> = files.iter().filter(|f| is_file(f)).map(|f| py::normpath(f)).collect();
     defs.parse_all(&present);
-    for f in files.iter().filter(|f| !is_file(f)) {
-        // the JSON keeps stdout to the document
-        let msg = format!("{}: no such file", py::display(f));
-        if as_json { eprintln!("{msg}") } else { out.line(&msg) }
-    }
     if as_json {
         for path in &present {
             defs.get(path, &mut lines);
@@ -173,9 +171,12 @@ fn outline(files: Vec<OsString>, out: &mut Out) {
                 (path.as_slice(), parsed, found)
             })
             .collect();
-        out.json(&json::outline(&parsed));
-        out.flush().ok();
-        std::process::exit(if missing { 1 } else { 0 });
+        let absent: Vec<Vec<u8>> = files.iter().filter(|f| !is_file(f)).cloned().collect();
+        // the document names the missing files, so the run succeeds
+        return out.json(&json::outline(&parsed, &absent));
+    }
+    for f in files.iter().filter(|f| !is_file(f)) {
+        out.line(&format!("{}: no such file", py::display(f)));
     }
     for path in &present {
         let shown = py::display(path);

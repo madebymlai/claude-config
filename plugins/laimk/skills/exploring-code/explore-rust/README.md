@@ -68,9 +68,8 @@ The rg flags taken are:
 - **Patterns, threads and messages:** `-e -f -j`, `--no-messages`, `--no-ignore-messages`, `--no-config`.
 - **Negations:** the `--no-*` forms of those switches, and the other way round.
 
-The one rg flag explore-rust refuses that the Python script passes to rg is `--passthrough` (see below). A flag rg
-does not know is refused with `explore: FLAG is not supported by explore-rust`, where the Python script's rg reports
-it; both exit 2.
+A flag rg does not know is refused with `explore: FLAG is not supported by explore-rust`, where the Python script's
+rg reports it; both exit 2.
 
 ## JSON
 
@@ -78,17 +77,20 @@ it; both exit 2.
 from. `--help` gives the schema. The structs in [`src/json.rs`](src/json.rs) declare their fields in the Python
 script's key order, and serde_json's compact writer escapes as `json.dumps(separators=(",", ":"),
 ensure_ascii=False)` does. A name that is not UTF-8 holds each undecodable byte as the text prints it, as the six
-characters `\udcXX`, which JSON writes as `\\udcXX`. `show` refuses `--json`.
+characters `\udcXX`, which JSON writes as `\\udcXX`. `show` refuses `--json`. A `--json` run that succeeds writes
+only the document and exits 0, with `outline`'s missing FILE arguments in `missing`.
 
 `regress/run.py` compares its JSON cases with `scripts/explore` byte for byte. When the bytes differ, it also says
-whether the documents are equal once decoded with msgspec.
+whether the documents are equal once decoded with msgspec. It reports any successful `--json` run, by either
+implementation, that writes to stderr. It also runs both with a failing ast-grep and with none on `PATH`, and checks
+that each run either succeeds with nothing on stderr and `warnings` as the document's last key, or fails with a
+message and no document.
 
 ## Deliberate differences from the Python script
 
 - **`--help`** describes this binary: tree-sitter instead of ast-grep.
-- **`--passthrough` is refused**, with the Python script's wording. It is rg's alias of `--passthru`, which the
-  script refuses, and the alias is missing from the script's REFUSED set. Every line of a file with no match then
-  arrives as context with no match to belong to, and the script fails with a KeyError (exit 1) on such a file.
+- **`warnings` is always empty in `--json`.** The Python script lists there that ast-grep is missing or exited
+  nonzero, and without ast-grep its `outline` fails. explore-rust parses in process and has neither to report.
 - **Line numbers in `show`** must be ASCII digits. Python's `isdigit` and `\d` also accept other scripts' digits.
 
 ## Regression harness

@@ -10,6 +10,7 @@ A --json case compares bytes too; when they differ, it also reports whether the 
 with msgspec. Differing outputs are written to DIR (default /tmp/explore-rust-regress) as CASE.py and CASE.rs.
 """
 import argparse
+import json
 import glob
 import os
 import re
@@ -463,6 +464,9 @@ fx      outline --json @glob:langs/*
 fx      outline --json skip/nodefs.rs skip/empty.rs skip/Upper.JAVA skip/notes.txt skip/locked.rs no/such.rs
 fx      outline --json lat/n%E4me.rs lat/d%EFr/k.py
 fx      outline --json big/huge.rs
+fx      outline --json no/such.rs
+fx      outline --json langs/a.rs no/such.rs langs ./no/such.rs
+fx      outline --json lat/n%E4me.r%E4 lat/n%E4me.rs
 fx      show --json langs/a.rs:3
 m       hits --json NEEDLE_
 m       outline --json @ls:*
@@ -517,9 +521,65 @@ def json_diagnosis(args, want, got):
     return "  [--json: equal once parsed]" if same and want[1] == got[1] else "  [--json: differs once parsed]"
 
 
-def run(cmd, cwd):
-    r = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True)
+def run(cmd, cwd, env=None):
+    """Stdout and exit code of CMD; its stderr goes to STDERRS when the run is a --json one that succeeded."""
+    r = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, env=env)
+    if b"--json" in cmd and r.returncode == 0 and r.stderr:
+        STDERRS.append((cmd, r.stderr))
     return r.stdout, r.returncode
+
+
+# successful --json runs that wrote to stderr, which a reader merging stderr into stdout cannot parse
+STDERRS = []
+STUBS = "/tmp/explore-rust-stubs"
+
+
+def stub_paths():
+    """PATH values for the warning checks: one whose ast-grep fails, and one with no ast-grep."""
+    fail, none = os.path.join(STUBS, "fail"), os.path.join(STUBS, "none")
+    for d in (fail, none):
+        os.makedirs(d, exist_ok=True)
+        for tool in ("rg", "git"):
+            link = os.path.join(d, tool)
+            if not os.path.lexists(link):
+                os.symlink(subprocess.run(["which", tool], capture_output=True, text=True).stdout.strip(), link)
+    with open(os.path.join(fail, "ast-grep"), "w") as f:
+        f.write("#!/bin/sh\necho 'ast-grep: simulated failure' >&2\nexit 3\n")
+    os.chmod(os.path.join(fail, "ast-grep"), 0o755)
+    return {"ast-grep fails": fail, "no ast-grep": none}
+
+
+# --json runs while ast-grep fails or is missing: the outputs differ by design, since explore-rust parses without
+# ast-grep, so these check what both must do: succeed with nothing on stderr and the document ending in warnings, or
+# fail with a message on stderr and no document
+WARNING_CASES = """
+fx      hits --json NEEDLE_RS
+fx      outline --json langs/a.rs no/such.rs
+"""
+
+
+def check_warnings(py, rust):
+    failures = []
+    for why, path in stub_paths().items():
+        env = dict(os.environ, PATH=path)
+        for key, args in cases(WARNING_CASES):
+            for name, cmd in (("python", [os.fsencode(sys.executable), b"-I", os.fsencode(py)]), ("rust", [os.fsencode(rust)])):
+                r = subprocess.run([*cmd, *args], cwd=DIRS[key], stdin=subprocess.DEVNULL, capture_output=True,
+                                   env=env)
+                label = f"{why}: {name} {shlex.join(os.fsdecode(a) for a in args)}"
+                try:
+                    doc = json.loads(r.stdout)
+                    last = list(doc)[-1]
+                except (ValueError, IndexError):
+                    doc, last = None, None
+                if r.returncode != 0 and not r.stdout:
+                    # an error: a message on stderr and no document, as the --help says
+                    print(f"  error, {label}: exit {r.returncode}: {os.fsdecode(r.stderr).strip()}")
+                elif r.returncode != 0 or r.stderr or last != "warnings":
+                    failures.append(f"{label}: exit {r.returncode}, stderr {r.stderr[:80]!r}, last key {last}")
+                else:
+                    print(f"  warnings, {label}: {doc['warnings']}")
+    return failures
 
 
 def main():
@@ -531,6 +591,8 @@ def main():
     ap.add_argument("--py", default=PY, help="the Python explore to compare with (default: scripts/explore)")
     ap.add_argument("--keep", action="store_true", help="write every case's Python output to DIR, as CASE.out")
     a = ap.parse_args()
+    # a label can hold a name that is not UTF-8, as its surrogate escapes
+    sys.stdout.reconfigure(errors="backslashreplace")
     # a copy, so that edits to the script while the run goes on do not move the oracle
     py = os.path.join(a.out + "-oracle", "explore")
     os.makedirs(os.path.dirname(py), exist_ok=True)
@@ -570,7 +632,12 @@ def main():
         print("  differs: " + label)
     for label in skipped:
         print("  skipped: " + label)
-    sys.exit(1 if differ else 0)
+    for cmd, err in STDERRS:
+        print(f"  stderr on a successful --json run: {shlex.join(os.fsdecode(c) for c in cmd)}: {err[:200]!r}")
+    failures = [] if a.only else check_warnings(py, os.path.abspath(a.bin))
+    for f in failures:
+        print("  warning check failed: " + f)
+    sys.exit(1 if differ or STDERRS or failures else 0)
 
 
 main()

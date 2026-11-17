@@ -24,8 +24,8 @@ const DIGEST: &[&str] = &["-l", "-c", "--files-with-matches", "--count", "--coun
 /// rg's flags that hits cannot honour: those of its standard printer and their negations, which leave its JSON as it
 /// is, those that replace the search with other output, and those that only write to stderr
 const REFUSED: &[&str] = &[
-    "--files", "--files-without-match", "--vimgrep", "-q", "--quiet", "-r", "--replace", "--passthru", "--stats",
-    "--null", "-0", "--heading", "-p", "--pretty", "-b", "--byte-offset", "--no-byte-offset", "--column",
+    "--files", "--files-without-match", "--vimgrep", "-q", "--quiet", "-r", "--replace", "--passthru", "--passthrough",
+    "--stats", "--null", "-0", "--heading", "-p", "--pretty", "-b", "--byte-offset", "--no-byte-offset", "--column",
     "--no-column", "--context-separator", "--no-context-separator", "--field-context-separator",
     "--field-match-separator", "--hostname-bin", "--hyperlink-format", "--include-zero", "--no-include-zero", "-M",
     "--max-columns", "--max-columns-preview", "--no-max-columns-preview", "-o", "--only-matching", "--path-separator",
@@ -489,9 +489,6 @@ pub fn rg_flags(flags: &[Vec<u8>]) -> Search {
             _ => (tok.to_string(), None),
         };
         match flag(&name) {
-            // rg's alias of --passthru, which explore refuses: it prints every line of a file that has no match as
-            // context, with no match to belong to
-            None if name == "--passthrough" => die("--passthrough is not supported by hits; run rg directly for it"),
             None => die(&format!("{name} is not supported by explore-rust")),
             Some(Kind::Switch(set)) => {
                 if inline.is_some() {

@@ -122,7 +122,13 @@ struct Hits<'a> {
     skips: Vec<Skip>,
     hidden: &'a [Name],
     errors: &'a [String],
+    warnings: Warnings,
 }
+
+/// What the Python script's --json holds in place of its stderr warnings: that ast-grep is missing or exited
+/// nonzero. explore-rust parses in process, so it has none to give.
+#[derive(Serialize)]
+struct Warnings([(); 0]);
 
 /// What a `hits` document is made from; its rows and skips are drawn from LISTING when it is written.
 pub struct HitsOwned<'a> {
@@ -181,6 +187,7 @@ impl Serialize for HitsOwned<'_> {
             skips,
             hidden: &self.hidden,
             errors: self.errors,
+            warnings: Warnings([]),
         }
         .serialize(s)
     }
@@ -196,10 +203,14 @@ pub struct OutlineFile<'a> {
 pub struct Outline<'a> {
     files: Vec<OutlineFile<'a>>,
     skips: Vec<Skip>,
+    /// the FILE arguments that are not files, as given
+    missing: Vec<Name>,
+    warnings: Warnings,
 }
 
-/// The outline of FILES, each with its parse and its definitions' depths.
-pub fn outline<'a>(files: &[(&[u8], Option<&'a Parsed>, Vec<(usize, &'a Def)>)]) -> Outline<'a> {
+/// The outline of FILES, each with its parse and its definitions' depths, and of MISSING, the arguments that are
+/// not files.
+pub fn outline<'a>(files: &[(&[u8], Option<&'a Parsed>, Vec<(usize, &'a Def)>)], missing: &[Vec<u8>]) -> Outline<'a> {
     Outline {
         files: files
             .iter()
@@ -209,6 +220,8 @@ pub fn outline<'a>(files: &[(&[u8], Option<&'a Parsed>, Vec<(usize, &'a Def)>)])
             })
             .collect(),
         skips: files.iter().filter_map(|(path, parsed, _)| skip(path, *parsed)).collect(),
+        missing: missing.iter().map(|f| Name::new(f)).collect(),
+        warnings: Warnings([]),
     }
 }
 
