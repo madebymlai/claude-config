@@ -49,8 +49,11 @@ null when it has none (a Rust impl is named by its type). A skip is
            text the whole line and ctx the -A/-B/-C lines grouped with it,
            [{line, text}]. hidden lists the matched files tagged hidden, errors
            all of rg's errors.
-  outline: {files: [{file, defs: [def + depth]}], skips}
-An error exits nonzero with its message on stderr, as in text.
+  outline: {files: [{file, defs: [def + depth]}], skips, missing}
+           missing lists the FILE arguments that are not files.
+warnings (both) holds what text mode writes to stderr, so a --json run that
+succeeds writes only the document and exits 0. An error exits nonzero with
+its message on stderr and no document, as in text.
 """
 import json
 import os
@@ -335,7 +338,7 @@ def definitions(files):
                     entity[os.path.normpath(path)] = info
             if r.returncode != 0:
                 why = next((l for l in stderr if l.strip() and not l.startswith("sg: ")), "")
-                print(f"explore: ast-grep exited with {r.returncode}: {why}", file=sys.stderr)
+                warn(f"ast-grep exited with {r.returncode}: {why}")
             for f in batch:
                 path, info = os.path.normpath(source[f]), entity.get(f)
                 if info is not None and info.startswith("skipped="):
@@ -547,6 +550,7 @@ def search(flags, patterns, paths, cap, count):
 
 def hits(argv):
     cap, flags, patterns, paths, digest, as_json = parse_hits_args(argv)
+    collect_warnings(as_json)
     per_file, rows, searched, errors, hidden = search(flags, patterns, paths, -1 if digest else cap,
                                                        digest or "matched_lines")
     total = sum(per_file.values())
@@ -565,7 +569,7 @@ def hits(argv):
                     "counts": per_file if total and not listed else None,
                     "rows": match_rows(rows, anchors, defs, hidden) if listed else [],
                     "skips": skips(files, defs) if listed else [],
-                    "hidden": [p for p in per_file if p in hidden], "errors": errors})
+                    "hidden": [p for p in per_file if p in hidden], "errors": errors, "warnings": WARNINGS})
         return
     if not total:
         print(f"0 matches in {plural(searched, 'file')} searched")
@@ -607,7 +611,7 @@ def owners(rows):
     matches = [r for r in rows if r[3]]
     defs, no_parser = definitions(sorted({r[0] for r in matches}))
     if no_parser:
-        print("explore: ast-grep is not installed, so matches show no enclosing definition", file=sys.stderr)
+        warn("ast-grep is not installed, so matches show no enclosing definition")
     match_lines = {}
     for p, n, _, _, _ in matches:
         match_lines.setdefault(p, []).append(n)
@@ -682,9 +686,11 @@ def nested(defs):
 
 def outline(argv):
     as_json, files = "--json" in argv, [a for a in argv if a != "--json"]
+    collect_warnings(as_json)
     missing = [f for f in files if not os.path.isfile(f)]
-    for f in missing:
-        print(f"{f}: no such file", file=sys.stderr if as_json else sys.stdout)
+    if not as_json:
+        for f in missing:
+            print(f"{f}: no such file")
     present = [os.path.normpath(f) for f in files if os.path.isfile(f)]
     defs, no_parser = definitions(present)
     if no_parser:
@@ -692,8 +698,9 @@ def outline(argv):
     if as_json:
         print_json({"files": [{"file": path, "defs": [{**d._asdict(), "depth": depth} for depth, d in
                                                       nested(defs[path] if isinstance(defs.get(path), list) else [])]}
-                              for path in present], "skips": skips(present, defs)})
-        sys.exit(1 if missing else 0)
+                              for path in present], "skips": skips(present, defs), "missing": missing,
+                    "warnings": WARNINGS})
+        return
     for path in present:
         if path not in defs:
             print(f"{path}: (no parser)")
@@ -753,6 +760,22 @@ def show(argv):
 
 
 SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+WARNINGS = None  # a list while --json collects the warnings into its document
+
+
+def collect_warnings(as_json):
+    global WARNINGS
+    WARNINGS = [] if as_json else None
+
+
+def warn(msg):
+    """MSG on stderr, or into the --json document's warnings."""
+    if WARNINGS is None:
+        print(f"explore: {msg}", file=sys.stderr)
+    else:
+        WARNINGS.append(msg)
 
 
 def print_json(doc):
