@@ -347,6 +347,50 @@ def name_of(lang, path, var):
     return text
 
 
+def sg_source(f, data, n, tmp):
+    """The file ast-grep is to parse for F, whose bytes are DATA: F itself, or a UTF-8 copy with the same lines, in
+    TMP and numbered N. ast-grep skips a file that is not UTF-8 and panics on a name that is not, and drops a
+    definition that an ast-grep-ignore comment suppresses, even under --inline-rules, so such a file is parsed from a
+    copy whose comments read ast-grep-IGNORE, which ast-grep does not honour."""
+    try:
+        data.decode("utf-8")
+        os.fsencode(f).decode("utf-8")
+        if b"ast-grep-ignore" not in data:
+            return f
+    except UnicodeDecodeError:
+        pass
+    copy = os.path.join(tmp, f"{n}{os.path.splitext(f)[1]}")
+    with open(copy, "w", encoding="utf-8") as out:
+        out.write(decode(data).replace("ast-grep-ignore", "ast-grep-IGNORE"))
+    return copy
+
+
+def sg_entities(stderr):
+    """{path: what ast-grep says of the file} from the lines of its STDERR under --inspect entity, which writes
+    "sg: entity|file|PATH: language=Rust,..." for each file ast-grep parses and "sg: entity|file|PATH: skipped=REASON"
+    for each it skips; it writes neither for a file it finds no language for, such as one whose extension is in
+    capitals."""
+    entity = {}
+    for line in stderr:
+        if line.startswith("sg: entity|file|"):
+            path, _, info = line[len("sg: entity|file|"):].rpartition(": ")
+            entity[os.path.normpath(path)] = info
+    return entity
+
+
+def sg_skip(info, failed, found):
+    """Why ast-grep gave a file no definitions, from what --inspect entity said of it, INFO (see sg_entities), whether
+    its run FAILED and whether it FOUND definitions in the file: "ast-grep skipped: REASON", "ast-grep failed" or
+    "ast-grep skipped: no language"; None when it parsed the file."""
+    if info is not None and info.startswith("skipped="):
+        return "ast-grep skipped: " + info[len("skipped="):]
+    if failed and not found:
+        return "ast-grep failed"
+    if info is None:
+        return "ast-grep skipped: no language"
+    return None
+
+
 def definitions(files, placed=False):
     """({path: [Def]} for every file ast-grep parses, and for a file it did not parse the reason, such as
     "ast-grep failed" or "ast-grep skipped: fileTooLarge"; 1-based inclusive lines. The signature is the line holding
@@ -362,9 +406,6 @@ def definitions(files, placed=False):
     plain = "\n---\n".join(r for l in langs for r in rules(l))
     joined = "\n---\n".join([plain, *(r for l in langs for r in place_rules(l))]) if placed else plain
     with tempfile.TemporaryDirectory() as tmp:
-        # ast-grep skips a file that is not UTF-8 and panics on a name that is not, and drops a definition that an
-        # ast-grep-ignore comment suppresses, even under --inline-rules, so such a file is parsed from a UTF-8 copy
-        # with the same lines, whose comments read ast-grep-IGNORE, which ast-grep does not honour
         source, costly = {}, set()
         for n, f in enumerate(parsed):
             try:
@@ -376,18 +417,7 @@ def definitions(files, placed=False):
             if placed and place_cost(data) > PLACE_BUDGET:
                 costly.add(os.path.normpath(f))
                 warn(f"{f}: lines too long to place its matches in code, comments or strings; its subs show in: null")
-            try:
-                data.decode("utf-8")
-                os.fsencode(f).decode("utf-8")
-                if b"ast-grep-ignore" not in data:
-                    source[os.path.normpath(f)] = f
-                    continue
-            except UnicodeDecodeError:
-                pass
-            copy = os.path.join(tmp, f"{n}{os.path.splitext(f)[1]}")
-            with open(copy, "w", encoding="utf-8") as out:
-                out.write(decode(data).replace("ast-grep-ignore", "ast-grep-IGNORE"))
-            source[os.path.normpath(copy)] = f
+            source[os.path.normpath(sg_source(f, data, n, tmp))] = f
         cheap = [f for f in source if os.path.normpath(source[f]) not in costly]
         batches = [(cheap[i:i + 1000], placed) for i in range(0, len(cheap), 1000)]
         batches += [([f for f in source if os.path.normpath(source[f]) in costly], False)] if costly else []
@@ -420,26 +450,16 @@ def definitions(files, placed=False):
                         name_of(lang, path, name or other) if name or other else None)
                 # the rules report one kind after another; a file's definitions sort into the order of its tree
                 defs.setdefault(path, []).append((start, -end, rng.byteOffset.start, -rng.byteOffset.end, d))
-            # --inspect entity writes "sg: entity|file|PATH: language=Rust,..." for each file ast-grep parses and
-            # "sg: entity|file|PATH: skipped=REASON" for each it skips; it writes neither for a file it finds no
-            # language for, such as one whose extension is in capitals
             stderr = r.stderr.decode(errors="replace").splitlines()
-            entity = {}
-            for line in stderr:
-                if line.startswith("sg: entity|file|"):
-                    path, _, info = line[len("sg: entity|file|"):].rpartition(": ")
-                    entity[os.path.normpath(path)] = info
+            entity = sg_entities(stderr)
             if r.returncode != 0:
                 why = next((l for l in stderr if l.strip() and not l.startswith("sg: ")), "")
                 warn(f"ast-grep exited with {r.returncode}: {why}")
             for f in batch:
-                path, info = os.path.normpath(source[f]), entity.get(f)
-                if info is not None and info.startswith("skipped="):
-                    defs[path] = "ast-grep skipped: " + info[len("skipped="):]
-                elif r.returncode != 0 and not defs[path]:
-                    defs[path] = "ast-grep failed"
-                elif info is None:
-                    defs[path] = "ast-grep skipped: no language"
+                path = os.path.normpath(source[f])
+                why = sg_skip(entity.get(f), r.returncode != 0, defs[path])
+                if why:
+                    defs[path] = why
     for f in defs:
         if isinstance(defs[f], list):
             defs[f] = [d[-1] for d in sorted(defs[f], key=lambda d: d[:4])]
@@ -1023,4 +1043,5 @@ def main():
     commands[sys.argv[1]](sys.argv[2:])
 
 
-main()
+if __name__ == "__main__":
+    main()
