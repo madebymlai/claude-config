@@ -281,15 +281,29 @@ def hidden_tracked(paths, top):
         return set()
     # each pathspec is relative to TOP, through any symlink, and literal, so a name holding * or [ matches only itself;
     # TOP itself is the empty path, since a literal . matches no file
-    specs = [":(top,literal)" + (os.path.relpath(r, top) if r != top else "") for r in inside]
-    done = subprocess.run(["git", "ls-files", "-ci", "--exclude-standard", "-z", "--", *specs], stdin=subprocess.DEVNULL,
+    scope = inside or [os.getcwd()]  # without PATHS, the working directory
+    specs = [":(top,literal)" + (os.path.relpath(r, top) if r != top else "") for r in scope]
+    # hidden = tracked minus walked: the files the search's own walk skips, found without matching any ignore rule,
+    # which git ls-files -ci would do against every entry of the index; the walk runs while git lists the index
+    # both lists run from TOP and are compared as raw bytes, relative to TOP; only the files left over are converted
+    # to paths from the working directory
+    from_top = [os.path.relpath(r, top) for r in scope]
+    walk = subprocess.Popen(["rg", "--files", "--null", "--hidden", "--no-ignore-dot", "-g", "!.git", "--", *from_top],
+                            cwd=top, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    done = subprocess.run(["git", "ls-files", "-z", "--full-name", "--", *specs], cwd=top, stdin=subprocess.DEVNULL,
                           capture_output=True)
+    walked, walk_err = walk.communicate()
     if done.returncode != 0:
         # without this list the tracked files .gitignore hides would drop out of the result unannounced
         err = os.fsdecode(done.stderr).strip().splitlines()
         die(f"git ls-files exited with {done.returncode}: {err[0] if err else 'no message'}")
-    out = done.stdout
-    return {f for f in (os.path.normpath(os.fsdecode(n)) for n in out.split(b"\0") if n) if os.path.isfile(f)}
+    if walk.returncode == 2 and not walked:
+        err = os.fsdecode(walk_err).strip().splitlines()
+        die(f"rg --files exited with 2: {err[0] if err else 'no message'}")
+    seen = {n[2:] if n.startswith(b"./") else n for n in walked.split(b"\0")}
+    skipped = (os.path.join(top, os.fsdecode(n)) for n in done.stdout.split(b"\0") if n and n not in seen)
+    # a submodule is a directory in the index and a symlink is not walked: neither is a file the walk skipped
+    return {os.path.relpath(f) for f in skipped if os.path.isfile(f) and not os.path.islink(f)}
 
 
 def roots(files):
