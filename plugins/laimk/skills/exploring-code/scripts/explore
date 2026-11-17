@@ -17,8 +17,10 @@ submodule.
 Each match is shown under its owner chain (impl Foo > fn new), with the
 innermost definition's line range. Definitions come from ast-grep's parse of
 the file; a file in a language ast-grep does not parse shows (no parser), a
-file it returns no definitions for shows (no definitions found), and a file
-ast-grep failed on shows (ast-grep failed).
+file it returns no definitions for shows (no definitions found), a file
+ast-grep skipped shows (ast-grep skipped: REASON), with ast-grep's reason,
+such as permissionDenied, or no language when it finds none for the file, and
+a file ast-grep failed on shows (ast-grep failed).
 
 RG_FLAGS pass to rg, before or after PATTERN; after -- every token is PATTERN
 or PATH. Examples: -i -w -F -P -U -L -t java -g '*.rs' -C 2, and -E latin1,
@@ -122,8 +124,9 @@ def rule(lang):
 
 
 def definitions(files):
-    """{path: [(start, end, signature)]} for every file ast-grep parses, None for a file it failed on; 1-based
-    inclusive lines. The signature is the line holding the definition's name, which follows its annotations."""
+    """{path: [(start, end, signature)]} for every file ast-grep parses, and for a file it did not parse the reason,
+    such as "ast-grep failed" or "ast-grep skipped: fileTooLarge"; 1-based inclusive lines. The signature is the
+    line holding the definition's name, which follows its annotations."""
     parsed = [f for f in files if language(f)]
     defs = {f: [] for f in parsed}
     if not parsed or not shutil.which("ast-grep"):
@@ -134,8 +137,12 @@ def definitions(files):
         # UTF-8 copy with the same lines
         source = {}
         for n, f in enumerate(parsed):
-            with open(f, "rb") as fh:
-                data = fh.read()
+            try:
+                with open(f, "rb") as fh:
+                    data = fh.read()
+            except OSError:  # ast-grep cannot read it either, and reports why
+                source[os.path.normpath(f)] = f
+                continue
             try:
                 data.decode("utf-8")
                 os.fsencode(f).decode("utf-8")
@@ -148,8 +155,8 @@ def definitions(files):
         scanned = list(source)
         for i in range(0, len(scanned), 1000):
             batch = scanned[i:i + 1000]
-            r = subprocess.run(["ast-grep", "scan", "--inline-rules", rules, "--json=stream", "--", *batch],
-                               capture_output=True)
+            r = subprocess.run(["ast-grep", "scan", "--inline-rules", rules, "--json=stream", "--inspect", "entity",
+                                "--", *batch], capture_output=True)
             for raw in r.stdout.splitlines():
                 m = json.loads(raw)
                 path = os.path.normpath(source.get(os.path.normpath(m["file"]), m["file"]))
@@ -157,14 +164,28 @@ def definitions(files):
                 name = m.get("metaVariables", {}).get("single", {}).get("NAME")
                 label = name["range"]["start"]["line"] + 1 if name else start
                 defs.setdefault(path, []).append((start, end, read_lines(path)[label - 1].strip()))
+            # --inspect entity writes "sg: entity|file|PATH: language=Rust,..." for each file ast-grep parses and
+            # "sg: entity|file|PATH: skipped=REASON" for each it skips; it writes neither for a file it finds no
+            # language for, such as one whose extension is in capitals
+            stderr = r.stderr.decode(errors="replace").splitlines()
+            entity = {}
+            for line in stderr:
+                if line.startswith("sg: entity|file|"):
+                    path, _, info = line[len("sg: entity|file|"):].rpartition(": ")
+                    entity[os.path.normpath(path)] = info
             if r.returncode != 0:
-                why = next((l for l in r.stderr.decode(errors="replace").splitlines() if l.strip()), "")
+                why = next((l for l in stderr if l.strip() and not l.startswith("sg: ")), "")
                 print(f"explore: ast-grep exited with {r.returncode}: {why}", file=sys.stderr)
-                for f in batch:
-                    if not defs[os.path.normpath(source[f])]:
-                        defs[os.path.normpath(source[f])] = None
+            for f in batch:
+                path, info = os.path.normpath(source[f]), entity.get(f)
+                if info is not None and info.startswith("skipped="):
+                    defs[path] = "ast-grep skipped: " + info[len("skipped="):]
+                elif r.returncode != 0 and not defs[path]:
+                    defs[path] = "ast-grep failed"
+                elif info is None:
+                    defs[path] = "ast-grep skipped: no language"
     for f in defs:
-        if defs[f]:
+        if isinstance(defs[f], list):
             defs[f].sort(key=lambda d: (d[0], -d[1]))
     return defs, False
 
@@ -177,8 +198,8 @@ def owner_chain(defs, line):
 def heading(path, line, defs):
     if path not in defs:
         return "(no parser)"
-    if defs[path] is None:
-        return "(ast-grep failed)"
+    if isinstance(defs[path], str):
+        return f"({defs[path]})"
     if not defs[path]:
         return "(no definitions found)"
     chain = owner_chain(defs[path], line)
@@ -247,15 +268,27 @@ def parse_hits_args(argv):
 
 
 def git_top():
-    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
     return os.path.realpath(r.stdout.strip()) if r.returncode == 0 else None
 
 
 def hidden_tracked(paths, top):
-    inside = [p for p in paths if (os.path.realpath(p) + os.sep).startswith(top + os.sep)]
+    """The tracked files that .gitignore hides under PATHS, or under the working directory without PATHS; a PATH
+    outside the repository at TOP holds none."""
+    real = [os.path.realpath(p) for p in paths]
+    inside = [r for r in real if (r + os.sep).startswith(top + os.sep)]
     if paths and not inside:
         return set()
-    out = subprocess.run(["git", "ls-files", "-ci", "--exclude-standard", "-z", "--", *inside], capture_output=True).stdout
+    # each pathspec is relative to TOP, through any symlink, and literal, so a name holding * or [ matches only itself;
+    # TOP itself is the empty path, since a literal . matches no file
+    specs = [":(top,literal)" + (os.path.relpath(r, top) if r != top else "") for r in inside]
+    done = subprocess.run(["git", "ls-files", "-ci", "--exclude-standard", "-z", "--", *specs], stdin=subprocess.DEVNULL,
+                          capture_output=True)
+    if done.returncode != 0:
+        # without this list the tracked files .gitignore hides would drop out of the result unannounced
+        err = os.fsdecode(done.stderr).strip().splitlines()
+        die(f"git ls-files exited with {done.returncode}: {err[0] if err else 'no message'}")
+    out = done.stdout
     return {f for f in (os.path.normpath(os.fsdecode(n)) for n in out.split(b"\0") if n) if os.path.isfile(f)}
 
 
@@ -313,12 +346,12 @@ def search(flags, patterns, paths, cap, count):
     top = git_top()
     regexps = [a for p in patterns for a in ("-e", p)]
     walk = ["--hidden", "--no-ignore-dot", "-g", "!.git", *flags, *regexps, "--", *paths]
-    first = subprocess.Popen(rg_command(walk), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    first = subprocess.Popen(rg_command(walk), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     hidden = hidden_tracked(paths, top) if top else set()
     results = []
     if hidden:
         second = ["--no-ignore", "--hidden", *flags, "--max-depth", "1", *regexps, "--", *roots(hidden)]
-        r = subprocess.run(rg_command(second), capture_output=True)
+        r = subprocess.run(rg_command(second), stdin=subprocess.DEVNULL, capture_output=True)
         results.append((r.returncode, r.stdout, r.stderr))
     out, err = first.communicate()
     results.insert(0, (first.returncode, out, err))
@@ -417,8 +450,11 @@ def outline(files):
         if path not in defs:
             print(f"{path}: (no parser)")
             continue
+        if isinstance(defs[path], str):
+            print(f"{path}: ({defs[path]})")
+            continue
         if not defs[path]:
-            print(f"{path}: {'(ast-grep failed)' if defs[path] is None else '(no definitions found)'}")
+            print(f"{path}: (no definitions found)")
             continue
         print(path)
         stack = []
