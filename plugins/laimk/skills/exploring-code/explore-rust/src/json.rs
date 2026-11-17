@@ -93,18 +93,165 @@ pub struct Row<'a> {
     pub line: u64,
     pub text: &'a str,
     pub owners: Vec<JsonDef<'a>>,
+    pub test: bool,
     pub subs: Vec<Sub>,
     pub hidden: bool,
     pub ctx: Vec<Ctx<'a>>,
 }
 
-/// A submatch: its character columns, and whether it starts in code, a comment or a string.
+/// A submatch: its character columns, whether it starts in code, a comment or a string, and whether it is the name
+/// of a definition its line holds.
 #[derive(Serialize)]
 pub struct Sub {
     col: usize,
     end: usize,
     #[serde(rename = "in")]
     place: Option<&'static str>,
+    def: bool,
+}
+
+/// Whether a file named BASE is named as tests are: test.rs, tests.rs, testing.rs, test_*.py, conftest.py,
+/// *_test.(go|py|rs|rb|ex|exs), *Test(s)/*IT.(java|kt|scala), *.(test|spec).[jt]sx?, *_spec.rb.
+fn test_file(base: &str) -> bool {
+    if matches!(base, "test.rs" | "tests.rs" | "testing.rs" | "conftest.py")
+        || base.starts_with("test_") && base.ends_with(".py")
+    {
+        return true;
+    }
+    let Some((stem, ext)) = base.rsplit_once('.') else { return false };
+    match ext {
+        "go" | "py" | "rs" | "ex" | "exs" => stem.ends_with("_test"),
+        "rb" => stem.ends_with("_test") || stem.ends_with("_spec"),
+        "java" | "kt" | "scala" => stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("IT"),
+        "js" | "jsx" | "ts" | "tsx" => stem.ends_with(".test") || stem.ends_with(".spec"),
+        _ => false,
+    }
+}
+
+/// Whether a match in PATH, inside the definitions CHAIN, looks like test code: a directory or file named as tests
+/// are, a module named tests or test, or a class named Test*, *Test or *Tests. A guess from names alone, blind to a
+/// module that a #[cfg(test)] declares in another file.
+fn is_test(path_bytes: &[u8], chain: &[&Def]) -> bool {
+    let path = String::from_utf8_lossy(path_bytes);
+    let mut parts: Vec<&str> = path.split('/').collect();
+    let base = parts.pop().unwrap_or("");
+    if parts.iter().any(|d| matches!(*d, "test" | "tests" | "testing" | "__tests__" | "spec" | "specs")) || test_file(base) {
+        return true;
+    }
+    chain.iter().any(|d| match d.name.as_deref() {
+        Some(n) if d.kind == "mod_item" => n == "tests" || n == "test",
+        Some(n) if d.kind.contains("class") => {
+            n.strip_prefix("Test").and_then(|r| r.chars().next()).is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+                || n.ends_with("Test")
+                || n.ends_with("Tests")
+        }
+        _ => false,
+    }) || test_module(path_bytes)
+}
+
+thread_local! {
+    static TEST_MODULES: std::cell::RefCell<HashMap<Vec<u8>, bool>> = Default::default();
+}
+
+/// Python's `test_module`: whether PATH is a Rust file that its parent module's file declares under #[cfg(test)], as
+/// #[cfg(test)] mod x; does, or whose parent module is such a file.
+fn test_module(path: &[u8]) -> bool {
+    if let Some(known) = TEST_MODULES.with(|c| c.borrow().get(path).copied()) {
+        return known;
+    }
+    TEST_MODULES.with(|c| c.borrow_mut().insert(path.to_vec(), false));
+    let split = |p: &[u8]| -> (Vec<u8>, Vec<u8>) {
+        match p.iter().rposition(|&b| b == b'/') {
+            Some(i) => (p[..i].to_vec(), p[i + 1..].to_vec()),
+            None => (Vec::new(), p.to_vec()),
+        }
+    };
+    let (mut dir, base) = split(path);
+    let mut name = match base.strip_suffix(b".rs") {
+        Some(stem) if base != b"lib.rs" && base != b"main.rs" => stem.to_vec(),
+        _ => Vec::new(),
+    };
+    if name == b"mod" {
+        (dir, name) = split(&dir);
+    }
+    let mut result = false;
+    if !name.is_empty() {
+        let join = |f: &str| if dir.is_empty() { f.as_bytes().to_vec() } else { [&dir[..], b"/", f.as_bytes()].concat() };
+        let mut parents = vec![join("mod.rs"), join("lib.rs"), join("main.rs")];
+        if !dir.is_empty() {
+            parents.push([&dir[..], b".rs"].concat());
+        }
+        let name = String::from_utf8_lossy(&name).into_owned();
+        for parent in parents {
+            let Ok(data) = std::fs::read(crate::args::os(&parent)) else { continue };
+            let text = py::decode(&data);
+            if declares(&text, &name, true) {
+                result = true;
+                break;
+            }
+            if declares(&text, &name, false) {
+                result = test_module(&parent);
+                break;
+            }
+        }
+    }
+    TEST_MODULES.with(|c| c.borrow_mut().insert(path.to_vec(), result));
+    result
+}
+
+/// Whether TEXT declares module NAME by `mod NAME;`, with GATED under #[cfg(test)] and any other attributes and a
+/// pub between, as Python's regexes read it.
+fn declares(text: &str, name: &str, gated: bool) -> bool {
+    let ws = |s: &str| s.len() - s.trim_start_matches(char::is_whitespace).len();
+    // mod, whitespace, NAME, whitespace, ;
+    let mod_decl = |s: &str| -> bool {
+        let Some(r) = s.strip_prefix("mod") else { return false };
+        let k = ws(r);
+        if k == 0 {
+            return false;
+        }
+        let Some(r) = r[k..].strip_prefix(name) else { return false };
+        r[ws(r)..].starts_with(';')
+    };
+    if !gated {
+        return text.match_indices("mod").any(|(i, _)| {
+            !text[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') && mod_decl(&text[i..])
+        });
+    }
+    text.match_indices("#[cfg(test)]").any(|(i, m)| {
+        let mut r = &text[i + m.len()..];
+        r = &r[ws(r)..];
+        while r.starts_with("#[") {
+            let Some(j) = r.find(']') else { return false };
+            r = &r[j + 1..];
+            r = &r[ws(r)..];
+        }
+        if let Some(after) = r.strip_prefix("pub") {
+            let mut a = after;
+            if a.starts_with('(') {
+                match a.find(')') {
+                    Some(j) => a = &a[j + 1..],
+                    None => return mod_decl(r),
+                }
+            }
+            let k = ws(a);
+            if k > 0 && mod_decl(&a[k..]) {
+                return true;
+            }
+        }
+        mod_decl(r)
+    })
+}
+
+/// Whether the match at COL to END on line LINE, whose text is TEXT, is the name of a definition in DEFS that the
+/// line holds.
+fn is_def(defs: &[Def], line: u64, text: &str, col: usize, end: usize) -> bool {
+    defs.iter().any(|d| {
+        d.start as u64 <= line
+            && line <= d.end as u64
+            && d.sig == py::strip(text)
+            && d.name.as_deref() == Some(py::slice(text, col, end))
+    })
 }
 
 /// Where a character at 0-based LINE and COL sits among PLACES: in the innermost that holds it, the one starting
@@ -142,7 +289,7 @@ struct Hits<'a> {
     cap: u64,
     over: bool,
     counts: &'a Option<Counts>,
-    rows: Vec<Row<'a>>,
+    rows: Option<Vec<Row<'a>>>,
     skips: Vec<Skip>,
     hidden: &'a [Name],
     errors: &'a [String],
@@ -181,11 +328,13 @@ impl Serialize for HitsOwned<'_> {
             let mut at: HashMap<u64, usize> = HashMap::new();
             for r in f.rows.iter().filter(|r| r.is_match) {
                 at.insert(r.line, rows.len());
+                let chain = owner_chain(defs, r.line);
                 rows.push(Row {
                     file: Name::new(&f.path),
                     line: r.line,
                     text: &r.text,
-                    owners: owner_chain(defs, r.line).into_iter().map(JsonDef::from).collect(),
+                    test: is_test(&f.path, &chain),
+                    owners: chain.into_iter().map(JsonDef::from).collect(),
                     subs: r
                         .subs
                         .iter()
@@ -193,6 +342,7 @@ impl Serialize for HitsOwned<'_> {
                             col: s.col,
                             end: s.end,
                             place: f.places.as_deref().map(|p| place(p, r.line as usize - 1 + s.below, s.at)),
+                            def: s.below == 0 && is_def(defs, r.line, &r.text, s.col, s.end),
                         })
                         .collect(),
                     hidden: self.tagged.contains(&f.path),
@@ -216,7 +366,8 @@ impl Serialize for HitsOwned<'_> {
             cap: self.cap,
             over: self.over,
             counts: &self.counts,
-            rows,
+            // null when the text prints counts instead of the matches
+            rows: self.counts.is_none().then_some(rows),
             skips,
             hidden: &self.hidden,
             errors: self.errors,

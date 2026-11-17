@@ -321,6 +321,27 @@ def main():
     write("skip/..rs", "fn dots() { NEEDLE_DOTS }\n")
     write("skip/.rs", "fn dotonly() { NEEDLE_DOTONLY }\n")
     write("skip/locked.rs", "fn locked() { NEEDLE_LOCKED }\n")
+    # test code by name: directories, file names, a Rust tests module and test classes, and production code beside them
+    for rel in ("tests/a.rs", "spec/b.rb", "x/__tests__/c.js", "x/tests.rs", "x/test_d.py", "x/conftest.py",
+                "x/e_test.go", "x/f_spec.rb", "x/GTests.java", "x/HIT.kt", "x/i.spec.tsx", "x/j.test.js", "x/testify.rs",
+                "x/test.py", "x/Latest.java"):
+        write("testnames/" + rel, f"// NEEDLE_TESTNAME {rel}\n")
+    write("testnames/x/prod.rs", "fn tested() { NEEDLE_TESTNAME }\n"
+          "#[cfg(test)]\nmod tests {\n    fn tested() { NEEDLE_TESTNAME }\n}\n"
+          "mod testing {\n    fn tested() { NEEDLE_TESTNAME }\n}\n")
+    write("testnames/x/prod.py", "class TestK:\n    def m(self): NEEDLE_TESTNAME\n"
+          "class KTests:\n    def m(self): NEEDLE_TESTNAME\n"
+          "class Contest:\n    def m(self): NEEDLE_TESTNAME\n")
+    write("testnames/rs/lib.rs", "#[cfg(test)]\nmod gated;\nmod plain;\n#[cfg(test)]\n#[path = \"p.rs\"]\npub(crate) mod gated2;\n"
+          "mod outer;\n#[cfg(test)] mod gated_dir;\nmod gatedx; // NEEDLE_TESTNAME\n")
+    for rel in ("gated.rs", "plain.rs", "gated2.rs", "outer.rs", "gated_dir/mod.rs", "gated/sub.rs", "outer/inner.rs", "gatedx.rs"):
+        write("testnames/rs/" + rel, f"fn f() {{ NEEDLE_TESTNAME }} // {rel}\n")
+    write("testnames/rs/gated.rs", "mod sub;\nfn f() { NEEDLE_TESTNAME }\n")
+    write("testnames/rs/outer.rs", "#[cfg(test)]\nmod inner;\nfn f() { NEEDLE_TESTNAME }\n")
+    write("testnames/x/classes.py", "class Testable:\n    def m(self): NEEDLE_TESTNAME\nclass Test_K:\n    def m(self): NEEDLE_TESTNAME\n"
+          "class Test:\n    def m(self): NEEDLE_TESTNAME\n")
+    write("testnames/x/defs.rs", "fn NEEDLE_DEF() {}\nstruct NEEDLE_DEFS;\nfn caller() { NEEDLE_DEF(); }\n"
+          "/// NEEDLE_DEF in a doc comment\nfn other() {} // NEEDLE_DEF\nimpl NEEDLE_DEFS {\n    fn NEEDLE_DEF() {}\n}\n")
     write("skip/suppressed.rs", "// ast-grep-ignore\nfn hidden_by_comment() { SUPPRESSED_NEEDLE }\n")
     write("skip/bom.rs", "﻿fn bom() { NEEDLE_BOM }\n")
     write("skip/utf16.rs", "fn wide() { NEEDLE_UTF16 }\n".encode("utf-16"), "wb")

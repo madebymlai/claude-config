@@ -465,6 +465,14 @@ fx      hits --json NEEDLE_TRACKED
 fx      hits --json -U 'MLSTART\\n\\s*MLEND'
 fx      hits --json NEEDLE_RS
 fx      hits --json NEEDLE_C
+fx      hits --json NEEDLE_TESTNAME testnames
+fx      hits --json -w 'NEEDLE_DEFS?' testnames
+fx      hits --json -l NEEDLE_TESTNAME testnames
+fx      hits -w -e '\\.due\\(' testnames
+fx      hits -w -F 'due(' testnames
+fx      hits -w '^\\w+$' testnames
+fx      hits NEEDLE_TESTNAME testnames nosuch
+fx      hits --head-limit 5 NEEDLE_TESTNAME
 fx      hits -- --json langs
 fx      outline --json langs/a.rs langs/A.java langs/a.ts langs/a.cpp langs/a.c langs/a.kt langs/a.go
 fx      outline --json @glob:langs/*

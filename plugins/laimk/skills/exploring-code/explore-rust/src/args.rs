@@ -62,13 +62,17 @@ pub fn parse_hits(argv: Vec<OsString>) -> Hits {
     let (mut literal, mut from_file, mut json) = (false, false, false);
     let mut it = argv.into_iter().map(OsString::into_vec);
     let missing = || -> Vec<u8> { die("a flag is missing its value") };
+    // for each positional, the long flag given without a value right before it
+    let (mut befores, mut prev): (Vec<Option<Vec<u8>>>, Option<Vec<u8>>) = (Vec::new(), None);
     while let Some(tok) = it.next() {
         let (name, value) = match tok.iter().position(|&b| b == b'=') {
             Some(i) => (tok[..i].to_vec(), Some(tok[i + 1..].to_vec())),
             None => (tok.clone(), None),
         };
+        let bare = prev.take();
         if literal || !tok.starts_with(b"-") || tok == b"-" {
             positional.push(tok);
+            befores.push(bare);
         } else if tok == b"--" {
             literal = true;
         } else if tok == b"--json" {
@@ -90,7 +94,11 @@ pub fn parse_hits(argv: Vec<OsString>) -> Hits {
             die(&format!("{} is not supported by hits; run rg directly for it", crate::py::display(&name)));
         } else if tok.starts_with(b"--") {
             let takes = is(&name, LONG_WITH_VALUE) && value.is_none();
+            let given = value.is_some();
             let value = if takes { Some(it.next().unwrap_or_else(missing)) } else { None };
+            if !given && value.is_none() {
+                prev = Some(tok.clone());
+            }
             if !is(&name, DROPPED) {
                 flags.push(tok);
                 flags.extend(value);
@@ -131,15 +139,28 @@ pub fn parse_hits(argv: Vec<OsString>) -> Hits {
         }
     }
     // as in rg: with no -e or -f the first positional is the pattern, with either every positional is a path
-    if patterns.is_empty() && !from_file {
+    let by_flag = !patterns.is_empty() || from_file;
+    if !by_flag {
         if positional.is_empty() {
             die("usage: explore hits [RG_FLAGS] PATTERN [PATH...]   (a PATTERN starting with '-' goes after -e)");
         }
         patterns.push(positional.remove(0));
+        befores.remove(0);
     }
-    for p in &positional {
+    for (p, bare) in positional.iter().zip(&befores) {
         if std::fs::metadata(std::ffi::OsStr::from_bytes(p)).is_err() {
-            die(&format!("no such path: {}", crate::py::display(p)));
+            die(&no_such_path(p, bare.as_deref(), by_flag));
+        }
+    }
+    if flags.iter().any(|f| f == b"-w" || f == b"--word-regexp") {
+        let fixed = flags.iter().any(|f| f == b"-F" || f == b"--fixed-strings");
+        for p in &patterns {
+            let p = String::from_utf8_lossy(p);
+            if let Some((side, c)) = loose_edge(&p, fixed) {
+                die(&format!(
+                    "-w adds word boundaries outside the pattern, so '{p}', which {side} with '{c}', matches only beside a non-word character; drop -w and put \\b on the word's own edges"
+                ));
+            }
         }
     }
     let digest = if flags.iter().any(|f| is(f, DIGEST)) {
@@ -149,6 +170,68 @@ pub fn parse_hits(argv: Vec<OsString>) -> Hits {
     };
     flags.retain(|f| !is(f, DIGEST));
     Hits { cap, flags, patterns, paths: positional, digest, json }
+}
+
+/// Python's `no_such_path`: the error for a PATH that does not exist, saying why it was read as a path when the
+/// arguments show why: it follows BARE, a long flag given without a value, or the patterns came from -e or -f, or
+/// else it follows the pattern, where a second pattern lands.
+fn no_such_path(path: &[u8], bare: Option<&[u8]>, by_flag: bool) -> String {
+    let path = crate::py::display(path);
+    if let Some(bare) = bare {
+        let bare = crate::py::display(bare);
+        return format!(
+            "no such path: {path}, read as a path after {bare}; give a flag's value as {bare}=VALUE (hits caps its rows with --max N)"
+        );
+    }
+    if by_flag {
+        return format!("no such path: {path}; with -e or -f every positional is a path, so give each pattern its own -e");
+    }
+    format!("no such path: {path}; every argument after PATTERN is a path, so a second pattern needs -e, as in -e PAT1 -e PAT2")
+}
+
+/// Python's `loose_edge`: ("starts", c) or ("ends", c) when PATTERN's first or last character is a literal c that is
+/// not a word character, beside which -w finds a match only when a non-word character follows or precedes; None when
+/// neither edge is such a literal. A regex edge that is a class, a group, an escape such as \b or a repetition is
+/// not a literal.
+fn loose_edge(pattern: &str, fixed: bool) -> Option<(&'static str, char)> {
+    let mut p: Vec<char> = pattern.chars().collect();
+    if !fixed {
+        if p.first() == Some(&'^') {
+            p.remove(0);
+        }
+        if p.last() == Some(&'$') && !(p.len() >= 2 && p[p.len() - 2] == '\\') {
+            p.pop();
+        }
+    }
+    if p.is_empty() {
+        return None;
+    }
+    let loose = |c: char| c.is_ascii() && !(c.is_alphanumeric() || c == '_');
+    let n = p.len();
+    let (first, last) = if fixed {
+        (Some(p[0]), Some(p[n - 1]))
+    } else {
+        let first = if p[0] == '\\' {
+            if n > 1 && !p[1].is_alphanumeric() { Some(p[1]) } else { None }
+        } else if "([.".contains(p[0]) {
+            None
+        } else {
+            Some(p[0])
+        };
+        let last = if n > 1 && p[n - 2] == '\\' {
+            if p[n - 1].is_alphanumeric() { None } else { Some(p[n - 1]) }
+        } else if ")]*+?}.".contains(p[n - 1]) {
+            None
+        } else {
+            Some(p[n - 1])
+        };
+        (first, last)
+    };
+    match (first, last) {
+        (Some(c), _) if loose(c) => Some(("starts", c)),
+        (_, Some(c)) if loose(c) => Some(("ends", c)),
+        _ => None,
+    }
 }
 
 // ---- rg's reading of the flags ----------------------------------------------------------------

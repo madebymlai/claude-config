@@ -28,10 +28,13 @@ rg's --encoding, for text that is not UTF-8. -n and -N are accepted and
 dropped. A flag hits cannot honour is refused: rg's printing options, such as
 -o, -M, --column or --trim, and flags that print something other than a
 search, such as --files or --type-list. With -e PATTERN or -f FILE, every
-positional is a PATH. -l and -c print one line per file with its count of
-matching lines, --count-matches with its count of matches. --max N (or
---max=N) caps the matches printed (default 300); over the cap, hits prints
-counts by directory and file instead.
+positional is a PATH. -w refuses a PATTERN whose first or last character is
+a literal non-word character, such as the . and ( of a pattern for .due(,
+which -w would match only beside another non-word character. -l and -c
+print one line per file with its count of matching lines, --count-matches
+with its count of matches. --max N (or --max=N) caps the matches printed
+(default 300); over the cap, hits prints counts by directory and file
+instead.
 
 --json makes hits and outline print one JSON document, for a script to read;
 show prints text only, for reading. Paths are as the text prints them, lines
@@ -44,16 +47,25 @@ null when it has none (a Rust impl is named by its type). A skip is
   hits:    {total, files, searched, cap, over, counts, rows, skips, hidden, errors}
            total and files as the header counts them; counts is {path: n} for
            every file when the text prints counts (-l, -c, --count-matches, or
-           over the cap), else null. rows lists the matches, when the text does:
-           {file, line, text, owners: [def, outermost first], subs, hidden,
-           ctx}, with text the whole line and ctx the -A/-B/-C lines grouped
-           with it, [{line, text}]. subs has one {col, end, in} per match on
-           the line: 0-based character columns (under -U a match may run on
-           into the lines below, its columns counting their newlines), and in,
-           where the match starts: "code", "comment" or "string", or null when
-           ast-grep did not parse the file, or a warning says its lines are too
-           long to place matches in. hidden lists the matched files tagged
-           hidden, errors all of rg's errors.
+           over the cap), else null. rows lists the matches when the text does,
+           and is null when it prints counts instead: {file, line, text,
+           owners: [def, outermost first], test, subs, hidden, ctx}, with text
+           the whole line and ctx the -A/-B/-C lines grouped with it,
+           [{line, text}]. test is a guess from names that the match is test
+           code: a directory named test(s), testing, __tests__ or spec(s), a
+           file named as tests are (test_*.py, *_test.go, *Test.java,
+           *.spec.ts, ...), an owner that is a module named tests or test or a
+           class named Test followed by a capital or _, *Test or *Tests, or a
+           Rust file that its parent module declares under #[cfg(test)], as
+           #[cfg(test)] mod x; does, or one under such a module. subs has one
+           {col, end, in, def} per match on the line: col and end are 0-based
+           character columns, the match being text[col:end] (under -U a match
+           may run on into the lines below, its columns counting their
+           newlines); in is where the match starts: "code", "comment" or
+           "string", or null when ast-grep did not parse the file, or a warning
+           says its lines are too long to place matches in; def is true when
+           the match is the name of a definition this line holds. hidden lists
+           the matched files tagged hidden, errors all of rg's errors.
   outline: {files: [{file, defs: [def + depth]}], skips, missing}
            missing lists the FILE arguments that are not files.
 warnings (both) holds what text mode writes to stderr, so a --json run that
@@ -459,11 +471,14 @@ def parse_hits_args(argv):
     """(cap, rg flags, patterns, paths, digest, as_json), where digest is the field of rg's end stats that -l, -c or
     --count-matches prints per file, or None without them."""
     cap, flags, positional, patterns, it, literal, from_file, as_json = 300, [], [], [], iter(argv), False, False, False
+    befores, prev = [], None  # for each positional, the long flag given without a value right before it, or None
     try:
         for tok in it:
             name, eq, value = tok.partition("=")
+            bare, prev = prev, None
             if literal or not tok.startswith("-") or tok == "-":
                 positional.append(tok)
+                befores.append(bare)
             elif tok == "--":
                 literal = True
             elif tok == "--json":
@@ -484,6 +499,7 @@ def parse_hits_args(argv):
                 value = [next(it)] if name in LONG_WITH_VALUE and not eq else []
                 if name not in DROPPED:
                     flags += [tok] + value
+                prev = None if eq or value else tok
             else:
                 for i, ch in enumerate(tok[1:]):  # a cluster such as -inw, whose last flag may take a value: -A2, -ie PAT
                     if "-" + ch in REFUSED:
@@ -502,16 +518,61 @@ def parse_hits_args(argv):
     except StopIteration:
         die("a flag is missing its value")
     # as in rg: with no -e or -f the first positional is the pattern, with either every positional is a path
-    if not patterns and not from_file:
+    by_flag = bool(patterns) or from_file
+    if not by_flag:
         if not positional:
             die("usage: explore hits [RG_FLAGS] PATTERN [PATH...]   (a PATTERN starting with '-' goes after -e)")
-        patterns, positional = positional[:1], positional[1:]
+        patterns, positional, befores = positional[:1], positional[1:], befores[1:]
     paths = positional
-    for p in paths:
+    for p, bare in zip(paths, befores):
         if not os.path.exists(p):
-            die(f"no such path: {p}")
+            die(no_such_path(p, bare, by_flag))
+    if any(f in ("-w", "--word-regexp") for f in flags):
+        fixed = any(f in ("-F", "--fixed-strings") for f in flags)
+        for p in patterns:
+            edge = loose_edge(p, fixed)
+            if edge:
+                die(f"-w adds word boundaries outside the pattern, so '{p}', which {edge[0]} with '{edge[1]}', matches "
+                    "only beside a non-word character; drop -w and put \\b on the word's own edges")
     digest = ("matches" if "--count-matches" in flags else "matched_lines") if any(f in DIGEST for f in flags) else None
     return cap, [f for f in flags if f not in DIGEST], patterns, paths, digest, as_json
+
+
+def no_such_path(path, bare, by_flag):
+    """The error for a PATH that does not exist, saying why it was read as a path when the arguments show why: it
+    follows BARE, a long flag given without a value, or the patterns came from -e or -f (BY_FLAG), or else it follows
+    the pattern, where a second pattern lands."""
+    if bare:
+        return f"no such path: {path}, read as a path after {bare}; give a flag's value as {bare}=VALUE (hits caps its rows with --max N)"
+    if by_flag:
+        return f"no such path: {path}; with -e or -f every positional is a path, so give each pattern its own -e"
+    return f"no such path: {path}; every argument after PATTERN is a path, so a second pattern needs -e, as in -e PAT1 -e PAT2"
+
+
+def loose_edge(pattern, fixed):
+    """("starts", c) or ("ends", c) when PATTERN's first or last character is a literal c that is not a word character,
+    beside which -w finds a match only when a non-word character follows or precedes; None when neither edge is such
+    a literal. A regex edge that is a class, a group, an escape such as \\b or a repetition is not a literal."""
+    p = pattern
+    if not fixed:
+        p = p[1:] if p.startswith("^") else p
+        p = p[:-1] if p.endswith("$") and not p.endswith("\\$") else p
+    if not p:
+        return None
+    loose = lambda c: c.isascii() and not (c.isalnum() or c == "_")
+    if fixed:
+        first, last = p[0], p[-1]
+    else:
+        first = (p[1] if len(p) > 1 and not p[1].isalnum() else None) if p[0] == "\\" else (None if p[0] in "([." else p[0])
+        if len(p) > 1 and p[-2] == "\\":
+            last = None if p[-1].isalnum() else p[-1]
+        else:
+            last = None if p[-1] in ")]*+?}." else p[-1]
+    if first is not None and loose(first):
+        return ("starts", first)
+    if last is not None and loose(last):
+        return ("ends", last)
+    return None
 
 
 def git_top():
@@ -666,7 +727,7 @@ def hits(argv):
         print_json({"total": sum(r[3] for r in rows) if listed else total, "files": len(files) if listed else len(per_file),
                     "searched": searched, "cap": cap, "over": not digest and total > cap,
                     "counts": per_file if total and not listed else None,
-                    "rows": match_rows(rows, anchors, defs, where, hidden) if listed else [],
+                    "rows": match_rows(rows, anchors, defs, where, hidden) if listed else None if total else [],
                     "skips": skips(files, defs) if listed else [],
                     "hidden": [p for p in per_file if p in hidden], "errors": errors, "warnings": WARNINGS})
         return
@@ -726,17 +787,68 @@ def place(nodes, line, col):
     return max(held, key=lambda n: (n[0], n[1], -n[2], -n[3]))[4] if held else "code"
 
 
+TEST_DIRS = {"test", "tests", "testing", "__tests__", "spec", "specs"}
+TEST_FILE = re.compile(r"^(?:tests?\.rs|testing\.rs|test_.*\.py|conftest\.py|.*_test\.(?:go|py|rs|rb|ex|exs)"
+                       r"|.*(?:Tests?|IT)\.(?:java|kt|scala)|.*\.(?:test|spec)\.[jt]sx?|.*_spec\.rb)$")
+
+
+def is_test(path, chain):
+    """Whether a match in PATH, inside the definitions CHAIN, looks like test code: a directory or file named as tests
+    are, a module named tests or test, a class named Test followed by a capital or _, *Test or *Tests, or a Rust file
+    that a #[cfg(test)] declares as a module, or one under such a module. A guess from names and declarations."""
+    *dirs, base = path.split(os.sep)
+    if TEST_DIRS & set(dirs) or TEST_FILE.match(base):
+        return True
+    return any(d.kind == "mod_item" and d.name in ("tests", "test")
+               or "class" in d.kind and d.name and re.match(r"Test[A-Z_]|.*Tests?$", d.name) for d in chain) \
+        or test_module(path)
+
+
+def test_module(path, cache={}):
+    """Whether PATH is a Rust file that its parent module's file declares under #[cfg(test)], as #[cfg(test)] mod x;
+    does, or whose parent module is such a file."""
+    if path not in cache:
+        cache[path] = False
+        d, base = os.path.split(path)
+        name = base[:-len(".rs")] if base.endswith(".rs") and base not in ("lib.rs", "main.rs") else ""
+        if name == "mod":
+            d, name = os.path.split(d)
+        if name:
+            for parent in [os.path.join(d, f) for f in ("mod.rs", "lib.rs", "main.rs")] + ([d + ".rs"] if d else []):
+                try:
+                    text = "\n".join(read_lines(parent))
+                except OSError:
+                    continue
+                n = re.escape(name)
+                if re.search(r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+" + n + r"\s*;", text):
+                    cache[path] = True
+                    break
+                if re.search(r"(?<!\w)mod\s+" + n + r"\s*;", text):
+                    cache[path] = test_module(parent)
+                    break
+    return cache[path]
+
+
+def is_def(defs, num, text, col, end):
+    """Whether the match at COL to END on line NUM, whose text is TEXT, is the name of a definition in DEFS that the
+    line holds."""
+    return any(d.start <= num <= d.end and d.sig == text.strip() and d.name == text[col:end] for d in defs)
+
+
 def match_rows(rows, anchors, defs, where, hidden):
-    """The JSON row of each match in ROWS, with its owner chain, its submatches placed by WHERE, and the context lines
-    that belong to it."""
+    """The JSON row of each match in ROWS, with its owner chain, whether it looks like test code, its submatches placed
+    by WHERE and marked when they name a definition, and the context lines that belong to it."""
     out = {}
     for path, num, text, is_match, subs in rows:
         if is_match:
-            chain = owner_chain(defs[path], num) if isinstance(defs.get(path), list) else []
+            own = defs[path] if isinstance(defs.get(path), list) else []
+            chain = owner_chain(own, num)
             nodes = where.get(path)
             out[path, num] = {"file": path, "line": num, "text": text, "owners": [d._asdict() for d in chain],
+                              "test": is_test(path, chain),
                               "subs": [{"col": col, "end": end,
-                                        "in": None if nodes is None else place(nodes.get(num - 1 + below, ()), num - 1 + below, at)}
+                                        "in": None if nodes is None else place(nodes.get(num - 1 + below, ()), num - 1 + below, at),
+                                        "def": not below and is_def(own, num, text, col, end)}
                                        for col, end, below, at in subs],
                               "hidden": path in hidden, "ctx": []}
     for (path, num, text, is_match, _), anchor in zip(rows, anchors):

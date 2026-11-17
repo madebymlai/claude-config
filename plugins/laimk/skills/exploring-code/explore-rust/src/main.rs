@@ -47,10 +47,12 @@ PATH. Examples: -i -w -F -P -U -L -t java -g '*.rs' -C 2, and -E latin1, rg's
 flag hits cannot honour is refused: rg's printing options, such as -o, -M,
 --column or --trim, and flags that print something other than a search, such
 as --files or --type-list. With -e PATTERN or -f FILE, every positional is a
-PATH. -l and -c print one line per file with its count of matching lines,
---count-matches with its count of matches. --max N (or --max=N) caps the
-matches printed (default 300); over the cap, hits prints counts by directory
-and file instead.
+PATH. -w refuses a PATTERN whose first or last character is a literal non-word
+character, such as the . and ( of a pattern for .due(, which -w would match
+only beside another non-word character. -l and -c print one line per file with
+its count of matching lines, --count-matches with its count of matches. --max
+N (or --max=N) caps the matches printed (default 300); over the cap, hits
+prints counts by directory and file instead.
 
 --json makes hits and outline print one JSON document, for a script to read;
 show prints text only, for reading. Paths are as the text prints them, lines
@@ -63,16 +65,24 @@ null when it has none (a Rust impl is named by its type). A skip is
   hits:    {total, files, searched, cap, over, counts, rows, skips, hidden, errors}
            total and files as the header counts them; counts is {path: n} for
            every file when the text prints counts (-l, -c, --count-matches, or
-           over the cap), else null. rows lists the matches, when the text does:
-           {file, line, text, owners: [def, outermost first], subs, hidden,
-           ctx}, with text the whole line and ctx the -A/-B/-C lines grouped
-           with it, [{line, text}]. subs has one {col, end, in} per match on
-           the line: 0-based character columns (under -U a match may run on
-           into the lines below, its columns counting their newlines), and in,
-           where the match starts: \"code\", \"comment\" or \"string\", or null when
-           ast-grep did not parse the file, or a warning says its lines are too
-           long to place matches in. hidden lists the matched files tagged
-           hidden, errors all of rg's errors.
+           over the cap), else null. rows lists the matches when the text does,
+           and is null when it prints counts instead: {file, line, text,
+           owners: [def, outermost first], test, subs, hidden, ctx}, with text
+           the whole line and ctx the -A/-B/-C lines grouped with it,
+           [{line, text}]. test is a guess from names that the match is test
+           code: a directory named test(s), testing, __tests__ or spec(s), a
+           file named as tests are (test_*.py, *_test.go, *Test.java,
+           *.spec.ts, ...), or an owner that is a module named tests or test or
+           a class named Test*, *Test or *Tests; it cannot see a test module
+           declared in another file, as #[cfg(test)] mod x; does. subs has one
+           {col, end, in, def} per match on the line: col and end are 0-based
+           character columns, the match being text[col:end] (under -U a match
+           may run on into the lines below, its columns counting their
+           newlines); in is where the match starts: \"code\", \"comment\" or
+           \"string\", or null when ast-grep did not parse the file, or a warning
+           says its lines are too long to place matches in; def is true when
+           the match is the name of a definition this line holds. hidden lists
+           the matched files tagged hidden, errors all of rg's errors.
   outline: {files: [{file, defs: [def + depth]}], skips, missing}
            missing lists the FILE arguments that are not files.
 warnings (both) holds what text mode writes to stderr, so a --json run that
