@@ -766,8 +766,10 @@ pub fn search(hits: &Hits) -> Found {
     // rg searches nothing when no match is possible
     let possible = |s: &Search| (!patterns.is_empty() || s.invert) && s.max_count != Some(0);
     let (claimed, collected, stop) = (Mutex::new(HashSet::new()), AtomicU64::new(0), AtomicBool::new(false));
+    // --json keeps the rows past the cap, up to SHAPE_CAP, to shape them
+    let cap = if hits.json { hits.cap.max(crate::hits::SHAPE_CAP) } else { hits.cap };
     let pass = |keep, implicit, max_depth, search, visited| Pass {
-        cap: hits.cap,
+        cap,
         digest: hits.digest,
         cwd: &cwd,
         implicit,

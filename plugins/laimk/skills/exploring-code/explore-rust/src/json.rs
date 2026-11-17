@@ -99,8 +99,8 @@ pub struct Row<'a> {
     pub ctx: Vec<Ctx<'a>>,
 }
 
-/// A submatch: its character columns, whether it starts in code, a comment or a string, and whether it is the name
-/// of a definition its line holds.
+/// A submatch: its character columns, whether it starts in code, a comment or a string, whether it is the name of a
+/// definition its line holds, and its shape.
 #[derive(Serialize)]
 pub struct Sub {
     col: usize,
@@ -108,6 +108,89 @@ pub struct Sub {
     #[serde(rename = "in")]
     place: Option<&'static str>,
     def: bool,
+    shape: String,
+}
+
+/// The characters of a word before a match's qualifier, as Python's WORD.
+fn is_word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Python's `shape`: the shape of the match at COL to END of TEXT, a line of code: def, its place when that is not
+/// code, or the qualifier or word before it, ▮ for it, and the character after it. A match starting BELOW the line is
+/// shaped by its place alone.
+fn shape(text: &str, col: usize, end: usize, below: usize, place: Option<&str>, def: bool) -> String {
+    if def {
+        return "def".into();
+    }
+    if place != Some("code") || below > 0 {
+        return place.unwrap_or("unparsed").into();
+    }
+    let head = py::slice(text, 0, col);
+    let mut before = py::rstrip(head);
+    let op = ["::", "->", "."].into_iter().find(|o| before.ends_with(o));
+    if let Some(o) = op {
+        before = py::rstrip(&before[..before.len() - o.len()]);
+    }
+    let word = &before[before.trim_end_matches(is_word).len()..];
+    let q = match op {
+        Some(o) => format!("{word}{o}"),
+        None if before.len() != head.len() && !word.is_empty() => format!("{word} "),
+        None => String::new(),
+    };
+    let after = py::lstrip(py::slice(text, end, usize::MAX));
+    format!("{q}▮{}", after.chars().next().map_or(String::new(), String::from))
+}
+
+/// A shape's digest entry: how many matches have it, in how many files, the names of up to three innermost owners,
+/// and the first one's place and text.
+#[derive(Serialize)]
+pub struct ShapeEntry<'a> {
+    shape: String,
+    n: usize,
+    files: usize,
+    owners: Vec<Option<&'a str>>,
+    sample: String,
+}
+
+/// Python's `shapes`: one entry per shape of ROWS' matches, the most common first, ties in the order they appear.
+fn shapes<'a>(rows: &[Row<'a>]) -> Vec<ShapeEntry<'a>> {
+    let mut out: Vec<(ShapeEntry, HashSet<&str>)> = Vec::new();
+    for r in rows {
+        let owner = r.owners.last().and_then(|o| o.name);
+        for s in &r.subs {
+            let i = match out.iter().position(|(e, _)| e.shape == s.shape) {
+                Some(i) => i,
+                None => {
+                    let lead = py::char_len(r.text) - py::char_len(py::lstrip(r.text));
+                    let sample = format!(
+                        "{}:{}  {}",
+                        r.file.0,
+                        r.line,
+                        crate::hits::clip(py::strip(r.text), s.col as i64 - lead as i64, 160)
+                    );
+                    out.push((ShapeEntry { shape: s.shape.clone(), n: 0, files: 0, owners: Vec::new(), sample }, HashSet::new()));
+                    out.len() - 1
+                }
+            };
+            let (e, files) = &mut out[i];
+            e.n += 1;
+            files.insert(&r.file.0);
+            if !e.owners.contains(&owner) {
+                e.owners.push(owner);
+            }
+        }
+    }
+    let mut entries: Vec<ShapeEntry> = out
+        .into_iter()
+        .map(|(mut e, files)| {
+            e.files = files.len();
+            e.owners.truncate(3);
+            e
+        })
+        .collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.n));
+    entries
 }
 
 /// Whether a file named BASE is named as tests are: test.rs, tests.rs, testing.rs, test_*.py, conftest.py,
@@ -289,6 +372,7 @@ struct Hits<'a> {
     cap: u64,
     over: bool,
     counts: &'a Option<Counts>,
+    shapes: Option<Vec<ShapeEntry<'a>>>,
     rows: Option<Vec<Row<'a>>>,
     skips: Vec<Skip>,
     hidden: &'a [Name],
@@ -309,8 +393,10 @@ pub struct HitsOwned<'a> {
     pub cap: u64,
     pub over: bool,
     pub counts: Option<Counts>,
-    /// the files whose matches the text lists, empty when it prints counts
+    /// the files whose matches the text lists, or over the cap the files whose matches are shaped
     pub listing: Vec<Listed>,
+    /// whether the matches are few enough to digest by shape
+    pub shaped: bool,
     pub hidden: Vec<Name>,
     /// the tracked files .gitignore hides
     pub tagged: HashSet<Vec<u8>>,
@@ -329,20 +415,22 @@ impl Serialize for HitsOwned<'_> {
             for r in f.rows.iter().filter(|r| r.is_match) {
                 at.insert(r.line, rows.len());
                 let chain = owner_chain(defs, r.line);
+                let test = is_test(&f.path, &chain);
                 rows.push(Row {
                     file: Name::new(&f.path),
                     line: r.line,
                     text: &r.text,
-                    test: is_test(&f.path, &chain),
+                    test,
                     owners: chain.into_iter().map(JsonDef::from).collect(),
                     subs: r
                         .subs
                         .iter()
-                        .map(|s| Sub {
-                            col: s.col,
-                            end: s.end,
-                            place: f.places.as_deref().map(|p| place(p, r.line as usize - 1 + s.below, s.at)),
-                            def: s.below == 0 && is_def(defs, r.line, &r.text, s.col, s.end),
+                        .map(|s| {
+                            let place = f.places.as_deref().map(|p| place(p, r.line as usize - 1 + s.below, s.at));
+                            let def = s.below == 0 && is_def(defs, r.line, &r.text, s.col, s.end);
+                            let shaped = shape(&r.text, s.col, s.end, s.below, place, def);
+                            let shape = if test { format!("test {shaped}") } else { shaped };
+                            Sub { col: s.col, end: s.end, place, def, shape }
                         })
                         .collect(),
                     hidden: self.tagged.contains(&f.path),
@@ -353,10 +441,11 @@ impl Serialize for HitsOwned<'_> {
                 rows[at[anchor]].ctx.push(Ctx { line: r.line, text: &r.text });
             }
         }
+        let listed = self.counts.is_none();
         let skips = self
             .listing
             .iter()
-            .filter(|f| f.rows.iter().any(|r| r.is_match))
+            .filter(|f| listed && f.rows.iter().any(|r| r.is_match))
             .filter_map(|f| skip(&f.path, f.parsed.as_ref()))
             .collect();
         Hits {
@@ -366,8 +455,9 @@ impl Serialize for HitsOwned<'_> {
             cap: self.cap,
             over: self.over,
             counts: &self.counts,
+            shapes: self.shaped.then(|| shapes(&rows)),
             // null when the text prints counts instead of the matches
-            rows: self.counts.is_none().then_some(rows),
+            rows: listed.then_some(rows),
             skips,
             hidden: &self.hidden,
             errors: self.errors,

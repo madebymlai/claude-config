@@ -9,6 +9,8 @@ use crate::search::{Found, Row, search};
 use crate::{Out, die, json, py};
 
 const TAG: &str = "  [tracked, hidden by .gitignore]";
+/// --json digests the shapes of up to this many matching lines, or of the cap's worth when it is higher
+pub const SHAPE_CAP: u64 = 10_000;
 
 /// Python's `Counter.most_common`: by count, highest first, ties in insertion order.
 fn most_common(counts: &[(Vec<u8>, u64)]) -> Vec<&(Vec<u8>, u64)> {
@@ -94,6 +96,8 @@ fn document<'a>(
 ) -> json::HitsOwned<'a> {
     let listed_files = total > 0 && args.digest.is_none() && total <= args.cap;
     let over = args.digest.is_none() && total > args.cap;
+    // the matches past the cap are shaped too, up to SHAPE_CAP
+    let shaped = args.digest.is_none() && total <= args.cap.max(SHAPE_CAP);
     let hidden_files = files.iter().filter(|(p, _)| hidden.contains(p)).map(|(p, _)| json::Name::new(p)).collect();
     let (total, count, counts, listing) = if listed_files {
         let listing = listed(rows, true);
@@ -102,7 +106,7 @@ fn document<'a>(
         (matches, matched, None, listing)
     } else {
         let counts = (total > 0).then(|| json::Counts(files.iter().map(|(p, n)| (json::Name::new(p), *n)).collect()));
-        (total, files.len(), counts, Vec::new())
+        (total, files.len(), counts, if shaped && total > 0 { listed(rows, true) } else { Vec::new() })
     };
     json::HitsOwned {
         total,
@@ -112,6 +116,7 @@ fn document<'a>(
         over,
         counts,
         listing,
+        shaped,
         hidden: hidden_files,
         tagged: hidden.clone(),
         errors,
@@ -216,9 +221,10 @@ fn listed(rows: HashMap<Vec<u8>, HashSet<Row>>, placed: bool) -> Vec<Listed> {
         .collect()
 }
 
-/// The definitions holding LINE, outermost first; a definition starting on LINE is the match itself.
+/// The definitions holding LINE, outermost first, their leads included; a definition whose name is on LINE is the
+/// match itself.
 pub fn owner_chain(defs: &[Def], line: u64) -> Vec<&Def> {
-    defs.iter().filter(|d| (d.start as u64) < line && line <= d.end as u64).collect()
+    defs.iter().filter(|d| d.start as u64 <= line && line <= d.end as u64 && line != d.line as u64).collect()
 }
 
 /// A file's rows, in groups that share a heading, in line order.
@@ -254,7 +260,7 @@ fn counts(files: &[FileGroups]) -> (usize, usize, usize) {
 }
 
 /// WIDTH characters of TEXT around COLUMN, with ... where the line is cut.
-fn clip(text: &str, column: i64, width: i64) -> String {
+pub fn clip(text: &str, column: i64, width: i64) -> String {
     let len = py::char_len(text) as i64;
     if len <= width {
         return text.to_string();

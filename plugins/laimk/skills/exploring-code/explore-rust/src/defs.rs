@@ -11,7 +11,7 @@ use tree_sitter::{Language, Node, Parser};
 
 use crate::py;
 
-/// One definition: 1-based inclusive lines, and the line holding its name, stripped.
+/// One definition: 1-based inclusive lines, from the first of its leads, and the line holding its name, stripped.
 pub struct Def {
     /// the node kind, such as function_item
     pub kind: String,
@@ -21,6 +21,8 @@ pub struct Def {
     pub start: usize,
     pub end: usize,
     pub sig: String,
+    /// the line holding its name, or its node's first line when it has none
+    pub line: usize,
 }
 
 /// A comment or a string, or code put back inside a string, with 0-based lines and columns in characters, as
@@ -262,6 +264,16 @@ struct Compiled {
     type_field: Option<u16>,
     /// the place of each comment, string and interpolation kind
     places: HashMap<u16, &'static str>,
+    /// what leads a definition from outside its node (Python's LEADS): Rust's attribute_item, with the comment kinds
+    /// between it and the definition, or Python's decorated_definition
+    lead: Option<Lead>,
+}
+
+enum Lead {
+    /// an attribute_item, then any attribute_item or comment siblings, then the definition
+    Rust { attribute: u16, skipped: [u16; 3] },
+    /// a decorated_definition, whose definition field is the definition
+    Python { decorated: u16, definition: u16 },
 }
 
 fn compile(lang: &Lang) -> Compiled {
@@ -297,7 +309,18 @@ fn compile(lang: &Lang) -> Compiled {
             places.insert(kind(k), what);
         }
     }
-    Compiled { language, kinds, arrow_parent, arrow, name_fields, name_kinds, type_field, places }
+    let lead = match lang.name {
+        "rust" => Some(Lead::Rust {
+            attribute: kind("attribute_item"),
+            skipped: [kind("attribute_item"), kind("line_comment"), kind("block_comment")],
+        }),
+        "python" => Some(Lead::Python {
+            decorated: kind("decorated_definition"),
+            definition: language.field_id_for_name("definition").expect("python has a definition field").get(),
+        }),
+        _ => None,
+    };
+    Compiled { language, kinds, arrow_parent, arrow, name_fields, name_kinds, type_field, places, lead }
 }
 
 impl Compiled {
@@ -314,6 +337,24 @@ impl Compiled {
     /// A Rust impl's type, which names a definition that has no name child.
     fn type_node<'t>(&self, node: Node<'t>) -> Option<Node<'t>> {
         node.child_by_field_id(self.type_field?).filter(Node::is_named)
+    }
+
+    /// The definition NODE leads, if it is a lead: for an attribute, the first sibling after it that is neither an
+    /// attribute nor a comment, when that is a definition, as ast-grep's precedes with its stopBy finds it.
+    fn led<'t>(&self, node: Node<'t>) -> Option<Node<'t>> {
+        match self.lead.as_ref()? {
+            Lead::Rust { attribute, skipped } if node.kind_id() == *attribute => {
+                let mut next = node.next_sibling();
+                while let Some(n) = next.filter(|n| skipped.contains(&n.kind_id())) {
+                    next = n.next_sibling();
+                }
+                next.filter(|n| self.is_definition(*n))
+            }
+            Lead::Python { decorated, definition } if node.kind_id() == *decorated => {
+                node.child_by_field_id(*definition).filter(|n| self.is_definition(*n))
+            }
+            _ => None,
+        }
     }
 
     fn name_node<'t>(&self, node: Node<'t>) -> Option<Node<'t>> {
@@ -463,6 +504,8 @@ impl Definitions {
         let mut defs = Vec::new();
         let mut places = Vec::new();
         let mut columns = CharColumns::default();
+        // the first line of each led definition's leads, by the definition's first byte; a lead comes before it
+        let mut leads: HashMap<usize, usize> = HashMap::new();
         let mut cursor = tree.walk();
         'walk: loop {
             let node = cursor.node();
@@ -476,14 +519,22 @@ impl Definitions {
                     what,
                 });
             }
+            if let Some(led) = compiled.led(node) {
+                let line = node.start_position().row + 1;
+                leads.entry(led.start_byte()).and_modify(|l| *l = (*l).min(line)).or_insert(line);
+            }
             if compiled.is_definition(node) {
-                let (start, end) = (node.start_position().row + 1, node.end_position().row + 1);
+                let (first, end) = (node.start_position().row + 1, node.end_position().row + 1);
                 let name = compiled.name_node(node);
-                let label = name.map_or(start, |n| n.start_position().row + 1);
+                let label = name.map_or(first, |n| n.start_position().row + 1);
                 let sig = file_lines.get(label - 1).map_or("", |l| py::strip(l)).to_string();
                 let named = name.or_else(|| compiled.type_node(node)).map(|n| &text[n.byte_range()]);
                 let name = named.map(|t| name_of(lang.name, t));
-                defs.push(((node.start_byte(), std::cmp::Reverse(node.end_byte())), Def { kind: node.kind().to_string(), name, start, end, sig }));
+                let start = leads.get(&node.start_byte()).map_or(first, |&l| l.min(first));
+                defs.push((
+                    (node.start_byte(), std::cmp::Reverse(node.end_byte())),
+                    Def { kind: node.kind().to_string(), name, start, end, sig, line: label },
+                ));
             }
             if cursor.goto_first_child() {
                 continue;

@@ -9,15 +9,20 @@
 Common: --budget CHARS (default 6000), --tests (include test code)
 
 callers --json prints the whole climb as one JSON document, never cut by --budget, paths relative to the repository:
-  {target: {name, file, line}, edges: [{depth, kind, file, line, fn, into, test, text, tag}],
+  {target: {name, file, line}, edges: [{depth, kind, file, line, fn, into: {name, file, line}, test, text, tag, note}],
    set_aside: [{depth, into, counts}], entries: [{depth, kind, into, text}], skipped: [{file, reason}]}
-An edge is a site reaching the definition into ({name, file, line}) from inside fn, depth hops from the target. kind
+An edge is a site reaching the definition into from inside fn, depth hops from the target; fn is the definition
+holding the site, the attributes above it included, so a site in an rstest #[case(...)] is in the fn it decorates. kind
 is call, call? (a receiver not resolved, or a type name with several definitions not proven to be the calling file's
 own), new (the type constructed), reflect, reflect-cast, config, reads (a config key), or spawn (a place starting the
-program again, reaching its main: a further path, climbed --depth more levels). tag says why an edge is uncertain,
-null when it is resolved. test edges are test code: listed, counted in set_aside, climbed only with --tests. An entry
-is a definition the climb ends at: kind none (no caller, no link) or callback (an external trait's). A target naming
-no single definition prints {error} and exits 1.
+program again, reaching its main: a further path, climbed --depth more levels). tag says why a call? edge is uncertain
+and is null on every other edge. note says what a resolved link is, null when it is a plain call: the supertype a call
+goes through, the type constructed, the reflection or config key, how a spawn starts the program. test edges are test
+code: listed, counted in set_aside, climbed only with --tests. A definition's unresolved receivers are set aside when it
+has resolved callers or more than five unresolved ones; past depth 1, its test sites count among them. An unresolved
+site already listed as an edge, reached again through another definition, is counted in that one's set_aside as
+"listed above". An entry is a definition the climb ends at: kind none (no caller, no link) or callback (an external
+trait's). A target naming no single definition prints {error} and exits 1.
 """
 import hashlib, importlib.util, json, os, pickle, re, subprocess, sys, tempfile, threading, time
 from collections import Counter, defaultdict
@@ -113,6 +118,8 @@ def def_rules(lang):
         if kind in ("function_item", "function_signature_item"):
             parts.append({"any": [{"has": {"field": "return_type", "pattern": "$RET"}}, {"kind": kind}]})
         out.append(rule("def " + kind, lang, {"kind": kind, "all": parts}))
+    if lang in X.LEADS:     # the attributes above a definition, which its range takes in
+        out.append(json.loads(X.lead_rule(lang, list(KINDS[lang]))))
     return out
 
 
@@ -446,10 +453,13 @@ def build_index(root="."):
     if todo:
         with tempfile.TemporaryDirectory() as tmp:
             defs, sites, supers, bodies = defaultdict(list), defaultdict(lambda: defaultdict(list)), defaultdict(list), []
+            leads = defaultdict(list)
             nodes, reports, skipped = sg_scan(todo, RULES, tmp)
             for f, m in nodes:
                 if m.ruleId.startswith("def "):
                     defs[f].append((lang_of(f), m.ruleId[4:], m))
+                elif m.ruleId.startswith("lead-"):
+                    leads[f].append((m.range.byteOffset.start, m.range.start.line + 1))
                 else:
                     supers[f].append((m.range.byteOffset.start, type_head(X.name_of(lang_of(f), f, m))))
             for f, rid, ln, col, c in reports:
@@ -463,7 +473,8 @@ def build_index(root="."):
                     sites[f][cat] += recs
             for f in todo:
                 out = []
-                for lang, node, m in defs.get(f, []):
+                led = X.lead_lines([m.range.byteOffset.start for _, _, m in defs.get(f, [])], leads.get(f, []))
+                for i, (lang, node, m) in enumerate(defs.get(f, [])):
                     kind = KINDS[lang][node]
                     ret = single(lang, f, m, "RET")
                     if kind == "impl":
@@ -483,7 +494,9 @@ def build_index(root="."):
                             extra = caps(ret[0]) if lang == "rust" else [type_head(ret[0])] if ret[0] != "void" else []
                         else:
                             extra = []
-                    out.append((m.range.start.line + 1, m.range.end.line + 1, kind, name, extra, head_of(lang, head_text(f, m.range))[:200], at, node))
+                    first = m.range.start.line + 1
+                    out.append((first, m.range.end.line + 1, kind, name, extra, head_of(lang, head_text(f, m.range))[:200], at, node,
+                                min(first, led.get(i, first))))
                 out.sort(key=lambda d: (d[0], -d[1]))
                 s = {k: sorted(v, key=lambda r: r[:4]) for k, v in sites.get(f, {}).items()}
                 idx[f] = {"stat": stat[f], "defs": out, "sites": pickle.dumps(s, protocol=5), "skipped": skipped.get(f)}
@@ -543,7 +556,8 @@ class Repo:
         return seen
 
     def chain(self, f, line):
-        return [d for d in self.idx.get(f, {"defs": []})["defs"] if d[0] <= line <= d[1]]
+        """The definitions holding LINE in F, outermost first, the attributes above each included."""
+        return [d for d in self.idx.get(f, {"defs": []})["defs"] if d[8] <= line <= d[1]]
 
     def owner_type(self, chain):
         for d in reversed(chain):
@@ -561,11 +575,11 @@ class Repo:
 
     def is_test(self, f, chain):
         """Whether code in F, inside the definitions CHAIN, is test code, as explore's is_test decides it."""
-        return X.is_test(f, [X.Def(d[0], d[1], d[5], d[7], d[3]) for d in chain])
+        return X.is_test(f, [X.Def(d[8], d[1], d[5], d[7], d[3], d[6][0]) for d in chain])
 
     def owners(self, f, d):
-        """The definitions that hold the definition D of F, outermost first, as explore's owner_chain gives them."""
-        return X.owner_chain(self.idx[f]["defs"], d[0])
+        """The definitions that hold the definition D of F, outermost first."""
+        return [x for x in self.idx[f]["defs"] if x[0] < d[0] <= x[1]]
 
 
 def rg_rows(pattern, extra=(), paths=()):
@@ -724,11 +738,11 @@ def bound_locally(repo, p, ch, line, name):
                 or re.search(r"\blet\s+(?:mut\s+)?%s\b" % n, "\n".join(lines(p)[fn[0] - 1:line])))
 
 
-def callers_once(repo, f, d, own, include_tests):
-    """Call sites of the definition D (owner OWN) as (path, line, text, chain, verdict, text mark, test, tag), and the
-    counts of what was set aside. The verdict is yes, dyn, maybe or guess (a receiver whose type name has several
-    definitions, the calling file's own among them, not proven to be that one); the tag says why a site is not
-    resolved. Test sites are kept and, unless INCLUDE_TESTS, also counted as set aside."""
+def callers_once(repo, f, d, own):
+    """Call sites of the definition D (owner OWN) as (path, line, text, chain, verdict, text mark, test, tag, note,
+    column), and the counts of what was set aside. The verdict is yes, dyn, maybe or guess (a receiver whose type name
+    has several definitions, the calling file's own among them, not proven to be that one); the tag says why a site is
+    not resolved, the note which supertype a dyn call goes through. Test sites are kept."""
     name, lang = d[3], lang_of(f)
     rows = rg_rows(r"\b" + re.escape(name) + r"\b", ["-t", lang])
     kept, aside = [], Counter()
@@ -749,25 +763,24 @@ def callers_once(repo, f, d, own, include_tests):
             else:
                 types, how, proven = receiver(repo, p, rec, lang)
                 v = verdict(repo, own, f, types, how, lang, name)
-            tag = None if v == "yes" else "through " + ",".join(types or []) if v == "dyn" else \
+            tag = None if v in ("yes", "dyn") else \
                 "unresolved receiver: %s" % how if isinstance(how, str) else "unresolved receiver"
+            note = "through " + ",".join(types or []) if v == "dyn" else None
             if v != "no" and own and other_same_name(repo, p, f, own):
                 # P defines a type named as OWN: it is P's own unless the receiver is not proven to be that type
                 if proven and v == "yes":
                     v, types = "no", [own + " of " + os.path.basename(p)]
                 else:
-                    v, tag = "guess", "%s names %d types and %s defines its own; the receiver (%s, %s) is not proven to be it" % (
+                    v, note, tag = "guess", None, "%s names %d types and %s defines its own; the receiver (%s, %s) is not proven to be it" % (
                         own, len({g for g, x in repo.by_name[own] if x[2] == "type"}), os.path.basename(p), how,
                         ",".join(types or []) or "no type")
             if v == "no":
                 aside["other receiver: " + ",".join(types or [str(how)])] += 1
                 continue
             test = repo.is_test(p, ch)
-            if test and not include_tests:
-                aside["tests"] += 1
             via = "" if v == "yes" else " [via %s]" % ",".join(types or []) if v == "dyn" else \
                 " [?%s]" % tag if v == "guess" else " [?%s]" % (how if isinstance(how, str) else "")
-            kept.append((p, n, ls[n - 1].strip(), ch, v, via, test, tag))
+            kept.append((p, n, ls[n - 1].strip(), ch, v, via, test, tag, note, col))
         names = {x[6] for g, x in repo.by_name.get(name, []) if g == p}
         for n in sorted({r[1] for r in rows if r[0] == p}):
             for col in word_cols(ls[n - 1], name):
@@ -1072,9 +1085,13 @@ def cmd_callers(repo, target, depth, budget, include_tests, as_json=False):
     def place(f, d):
         return {"name": repo.label(f, repo.chain(f, d[0])), "file": rel(f), "line": d[0]}
 
-    def edge(level, kind, p, n, ch, into, test, text, tag):
+    # the call sites listed as edges, (path, line, column): a site the climb reaches again through another definition
+    # is listed again only when it is resolved, and otherwise counted under that definition as listed above
+    listed = set()
+
+    def edge(level, kind, p, n, ch, into, test, text, tag=None, note=None):
         doc["edges"].append({"depth": level + 1, "kind": kind, "file": rel(p), "line": n, "fn": repo.label(p, ch) if ch else None,
-                             "into": into, "test": test, "text": text, "tag": tag})
+                             "into": into, "test": test, "text": text, "tag": tag, "note": note})
 
     def walk(f, d, own, level, limit):
         key = (f, d[0])
@@ -1085,35 +1102,45 @@ def cmd_callers(repo, target, depth, budget, include_tests, as_json=False):
         into = place(f, d)
         if d[2] != "fn":
             own = d[3]
-        kept, aside = callers_once(repo, f, d, own, include_tests) if d[2] == "fn" else ([], Counter())
+        kept, aside = callers_once(repo, f, d, own) if d[2] == "fn" else ([], Counter())
         nxt = []
+        again = [k for k in kept if k[4] in ("maybe", "guess") and (k[0], k[1], k[9]) in listed]
+        if again:
+            aside["listed above"] += len(again)
+            kept = [k for k in kept if k not in again]
         # test sites are listed and counted, and climbed only with --tests
-        for p, n, text, ch, v, via, test, tag in kept:
-            if test and not include_tests:
-                edge(level, "call" if v in ("yes", "dyn") else "call?", p, n, ch, into, True, text, tag)
+        tests = [k for k in kept if k[6] and not include_tests]
         kept = [k for k in kept if include_tests or not k[6]]
         sure = [k for k in kept if k[4] in ("yes", "dyn")]
-        unsure = [k for k in kept if k[4] == "maybe"]
-        if len(unsure) > 5 or (sure and unsure):
-            aside["unresolved receivers (%s)" % ", ".join(sorted({"%s:%d" % (os.path.basename(k[0]), k[1]) for k in unsure})[:6])] += len(unsure)
+        # unresolved receivers are set aside beside resolved callers or past five; past depth 1 test sites count too
+        judged = kept + (tests if level else [])
+        unsure = [k for k in judged if k[4] == "maybe"]
+        if len(unsure) > 5 or (unsure and any(k[4] in ("yes", "dyn") for k in judged)):
+            # named production sites first
+            where = sorted({(k[6], "%s:%d" % (os.path.basename(k[0]), k[1])) for k in unsure})
+            aside["unresolved receivers (%s)" % ", ".join(w for _, w in where[:6])] += len(unsure)
             kept = [k for k in kept if k[4] != "maybe"]
+            tests = [k for k in tests if k[4] != "maybe"] if level else tests
+        if tests:
+            aside["tests"] += len(tests)
+        for p, n, text, ch, v, via, test, tag, note, col in tests:
+            listed.add((p, n, col))
+            edge(level, "call" if v in ("yes", "dyn") else "call?", p, n, ch, into, True, text, tag, note)
         # a guessed receiver is uncertain but climbed, so that a same-named type does not cut the chain
-        for p, n, text, ch, v, via, test, tag in kept:
+        for p, n, text, ch, v, via, test, tag, note, col in kept:
+            listed.add((p, n, col))
             lab = repo.label(p, ch)
             out.add(level, "call <-" if v in ("yes", "dyn") else "call? <-", p, n, lab + "  | " + text, via)
-            edge(level, "call" if v in ("yes", "dyn") else "call?", p, n, ch, into, test, text, tag)
+            edge(level, "call" if v in ("yes", "dyn") else "call?", p, n, ch, into, test, text, tag, note)
             fn = next((x for x in reversed(ch) if x[2] == "fn"), None)
             if fn and v != "maybe":
                 nxt.append((p, fn, repo.owner_type(ch)))
-        if aside:
-            out.add(level, "set aside:", None, 0, ", ".join("%d %s" % (c, k) for k, c in aside.most_common(6)))
-            doc["set_aside"].append({"depth": level + 1, "into": into, "counts": dict(aside)})
         if not sure:
             links = []
             for kind, p, n, text, ch in link_sites(repo, f, d, own):
                 if p and not include_tests and repo.is_test(p, ch):
                     head, _, rest = kind.partition(" ")
-                    edge(level, head, p, n, ch, into, True, text, rest or ("constructs " + own if head == "new" else None))
+                    edge(level, head, p, n, ch, into, True, text, note=rest or ("constructs " + own if head == "new" else None))
                 else:
                     links.append((kind, p, n, text, ch))
             if not links and d[2] == "fn":
@@ -1127,10 +1154,13 @@ def cmd_callers(repo, target, depth, budget, include_tests, as_json=False):
                 lab = repo.label(p, ch) if ch else ""
                 out.add(level, kind + " <-", p, n, (lab + "  | " if lab else "") + text)
                 head, _, rest = kind.partition(" ")
-                edge(level, head, p, n, ch, into, repo.is_test(p, ch), text, rest or ("constructs " + own if head == "new" else None))
+                edge(level, head, p, n, ch, into, repo.is_test(p, ch), text, note=rest or ("constructs " + own if head == "new" else None))
                 fn = next((x for x in reversed(ch) if x[2] == "fn"), None)
                 if fn and kind != "config":
                     nxt.append((p, fn, repo.owner_type(ch)))
+        if aside:
+            out.add(level, "set aside:", None, 0, ", ".join("%d %s" % (c, k) for k, c in aside.most_common(6)))
+            doc["set_aside"].append({"depth": level + 1, "into": into, "counts": dict(aside)})
         # a program's main is also reached by the places that start the program again; each is a path of its own,
         # climbed --depth levels from here
         spawned = []
@@ -1138,7 +1168,7 @@ def cmd_callers(repo, target, depth, budget, include_tests, as_json=False):
             for p, n, how in spawns_into(repo, f, d):
                 ch, text = repo.chain(p, n), lines(p)[n - 1].strip()
                 out.add(level, "spawn <-", p, n, repo.label(p, ch) + "  | " + text, " [starts this program: %s]" % how)
-                edge(level, "spawn", p, n, ch, into, False, text, "starts this program: " + how)
+                edge(level, "spawn", p, n, ch, into, False, text, note="starts this program: " + how)
                 spawned.append((p, next(x for x in reversed(ch) if x[2] == "fn"), repo.owner_type(ch)))
         expand(nxt, level, limit)
         expand(spawned, level, level + depth)
@@ -1311,7 +1341,7 @@ def main():
         for name in cands[:int(a[2])]:
             f, d = next((f, d) for f, d in repo.by_name[name] if d[2] == "fn" and lang_of(f) == lang and not repo.is_test(f, repo.chain(f, d[0])) and repo.owner_type(repo.owners(f, d)))
             own = repo.owner_type(repo.owners(f, d))
-            kept, aside = callers_once(repo, f, d, own, True)
+            kept, aside = callers_once(repo, f, d, own)
             raw = len(kept) + sum(aside.values())
             yes = sum(1 for k in kept if k[4] in ("yes", "dyn"))
             maybe = len(kept) - yes

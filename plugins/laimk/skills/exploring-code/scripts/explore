@@ -15,8 +15,12 @@ submodule's own .gitignore hides is found only when hits runs inside that
 submodule.
 
 Each match is shown under its owner chain (impl Foo > fn new), with the
-innermost definition's line range. Definitions come from ast-grep's parse of
-the file; a file in a language ast-grep does not parse shows (no parser), a
+innermost definition's line range. A definition's range takes in the
+attributes, annotations or decorators above it, so a line holding one, such
+as an rstest #[case(...)], belongs to the definition it decorates; the line
+holding a definition's name is the match itself, shown under the definitions
+around it. Definitions come from ast-grep's parse of the file; a file in a
+language ast-grep does not parse shows (no parser), a
 file it returns no definitions for shows (no definitions found), a file
 ast-grep skipped shows (ast-grep skipped: REASON), with ast-grep's reason,
 such as permissionDenied, or no language when it finds none for the file, and
@@ -34,7 +38,7 @@ which -w would match only beside another non-word character. -l and -c
 print one line per file with its count of matching lines, --count-matches
 with its count of matches. --max N (or --max=N) caps the matches printed
 (default 300); over the cap, hits prints counts by directory and file
-instead.
+instead, and --json the shapes of the matches too.
 
 --json makes hits and outline print one JSON document, for a script to read;
 show prints text only, for reading. Paths are as the text prints them, lines
@@ -44,11 +48,18 @@ null when it has none (a Rust impl is named by its type). A skip is
 {file, why, reason?}: a file that shows no definitions, with why one of
 "no parser", "no definitions", "failed", "skipped" (reason: ast-grep's, or
 "no language").
-  hits:    {total, files, searched, cap, over, counts, rows, skips, hidden, errors}
+  hits:    {total, files, searched, cap, over, counts, shapes, rows, skips,
+           hidden, errors}
            total and files as the header counts them; counts is {path: n} for
            every file when the text prints counts (-l, -c, --count-matches, or
-           over the cap), else null. rows lists the matches when the text does,
-           and is null when it prints counts instead: {file, line, text,
+           over the cap), else null. shapes digests the matches by the shape
+           of each (see subs), over the cap too: one {shape, n, files, owners,
+           sample} per shape, most common first, with n its matches, files the
+           files they are in, owners the names of up to three innermost owners
+           (null for none) and sample the first one's file:line and text. It is
+           null with -l, -c or --count-matches, and past 10,000 matching lines
+           or the cap, whichever is higher. rows lists the matches when the
+           text does, and is null when it prints counts instead: {file, line, text,
            owners: [def, outermost first], test, subs, hidden, ctx}, with text
            the whole line and ctx the -A/-B/-C lines grouped with it,
            [{line, text}]. test is a guess from names that the match is test
@@ -58,20 +69,28 @@ null when it has none (a Rust impl is named by its type). A skip is
            class named Test followed by a capital or _, *Test or *Tests, or a
            Rust file that its parent module declares under #[cfg(test)], as
            #[cfg(test)] mod x; does, or one under such a module. subs has one
-           {col, end, in, def} per match on the line: col and end are 0-based
-           character columns, the match being text[col:end] (under -U a match
+           {col, end, in, def, shape} per match on the line: col and end are
+           0-based character columns, the match being text[col:end] (under -U a match
            may run on into the lines below, its columns counting their
            newlines); in is where the match starts: "code", "comment" or
            "string", or null when ast-grep did not parse the file, or a warning
            says its lines are too long to place matches in; def is true when
-           the match is the name of a definition this line holds. hidden lists
-           the matched files tagged hidden, errors all of rg's errors.
+           the match is the name of a definition this line holds. shape is
+           "def" for such a match, else "comment", "string" or "unparsed" (in
+           null), else Q▮C: C is the first character after the match past
+           spaces, and Q is the . :: or -> right before it with the word before
+           that (s.▮( store::▮( .▮), else the word before it and a space
+           (new ▮), else empty (▮(). "test " leads the shape on a test row. A
+           match starting below its row's line (-U) is shaped by in alone.
+           hidden lists the matched files tagged hidden, errors all of rg's
+           errors.
   outline: {files: [{file, defs: [def + depth]}], skips, missing}
            missing lists the FILE arguments that are not files.
 warnings (both) holds what text mode writes to stderr, so a --json run that
 succeeds writes only the document and exits 0. An error exits nonzero with
 its message on stderr and no document, as in text.
 """
+import bisect
 import codecs
 import json
 import os
@@ -210,7 +229,18 @@ NAME_CHILD = {"c": NAME_FIELD + ({"field": "declarator"},), "cpp": NAME_FIELD + 
 # line: a Rust impl's type
 TYPE_CHILD = {"rust": {"field": "type"}}
 ARROW = "variable_declarator"  # the kind of an arrow-function binding
-Def = namedtuple("Def", "start end sig kind name")
+# language: what leads a definition from outside its node, so that its range takes it in: Rust's attributes, which
+# precede it as siblings, comments between them, and Python's decorators, which a decorated_definition wraps around it.
+# A lead belongs to the first definition starting after it. Java's annotations, and the attributes and decorators of the
+# other languages, are inside the definition's own node.
+LEADS = {"rust": lambda kinds: {"kind": "attribute_item", "precedes": {
+             "any": [{"kind": k} for k in kinds],
+             "stopBy": {"not": {"any": [{"kind": "attribute_item"}, {"kind": "line_comment"}, {"kind": "block_comment"}]}}}},
+         "python": lambda kinds: {"kind": "decorated_definition"}}
+# a definition's range, from its first lead, the line holding its name, its node kind and its name; line is not in the
+# JSON
+Def = namedtuple("Def", "start end sig kind name line")
+JSON_DEF = Def._fields[:5]
 
 
 def places(comment="", string="", code=""):
@@ -271,6 +301,10 @@ REFUSED = {"--files", "--files-without-match", "--vimgrep", "-q", "--quiet", "-r
            "-h", "--help", "-V", "--version", "--pcre2-version", "--type-list", "--generate", "--no-json",
            "--debug", "--trace"}
 TAG = "  [tracked, hidden by .gitignore]"
+# --json digests the shapes of up to this many matching lines, or of the cap's worth when it is higher; past it, shapes
+# is null
+SHAPE_CAP = 10_000
+WORD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$")
 
 
 def die(msg, code=2):
@@ -315,6 +349,25 @@ def rules(lang):
         if lang in TYPE_CHILD:
             named.append({"all": [kind, {"has": {**TYPE_CHILD[lang], "pattern": "$TYPE"}}]})
         yield json.dumps({"id": f"def-{lang}-{k}", "language": lang, "rule": {"any": named + [kind]}})
+    if lang in LEADS:
+        yield lead_rule(lang, kinds)
+
+
+def lead_rule(lang, kinds):
+    """ast-grep's rule for what leads LANG's definitions of KINDS (see LEADS), with its id lead-LANG."""
+    return json.dumps({"id": f"lead-{lang}", "language": lang, "rule": LEADS[lang](kinds)})
+
+
+def lead_lines(starts, leads):
+    """{index into STARTS: first line} for definitions with leads: STARTS are the definitions' byte offsets, LEADS
+    (byte offset, line) of each lead, which belongs to the first definition starting after it."""
+    order, out = sorted(range(len(starts)), key=lambda i: starts[i]), {}
+    ordered = [starts[i] for i in order]
+    for at, line in leads:
+        k = bisect.bisect_right(ordered, at)
+        if k < len(order):
+            out[order[k]] = min(out.get(order[k], line), line)
+    return out
 
 
 def place_rules(lang):
@@ -426,7 +479,7 @@ def definitions(files, placed=False):
                                 "--inspect", "entity", "--", *batch], capture_output=True)
             for f in batch if with_places else ():
                 where[os.path.normpath(source[f])] = {}
-            originals, place_of = {}, {}  # each file ast-grep names, and each place rule's place
+            originals, place_of, leads = {}, {}, {}  # each file ast-grep names, each place rule's place, and leads
             for m in SG.decode_lines(r.stdout):
                 path = originals.get(m.file)
                 if path is None:
@@ -441,15 +494,23 @@ def definitions(files, placed=False):
                     for line in range(rng.start.line, rng.end.line + 1):
                         where[path].setdefault(line, []).append(node)
                     continue
+                if m.ruleId.startswith("lead-"):
+                    leads.setdefault(path, []).append((rng.byteOffset.start, rng.start.line + 1))
+                    continue
                 single = m.metaVariables.single if m.metaVariables else Captures()
                 start, end = rng.start.line + 1, rng.end.line + 1
                 name, other = single.NAME, single.TYPE
                 label = name.range.start.line + 1 if name else start
                 lang, kind = m.ruleId[len("def-"):].split("-", 1)
                 d = Def(start, end, read_lines(path)[label - 1].strip(), kind,
-                        name_of(lang, path, name or other) if name or other else None)
+                        name_of(lang, path, name or other) if name or other else None, label)
                 # the rules report one kind after another; a file's definitions sort into the order of its tree
                 defs.setdefault(path, []).append((start, -end, rng.byteOffset.start, -rng.byteOffset.end, d))
+            for path, ls in leads.items():
+                found = defs.get(path, [])
+                for i, line in lead_lines([d[2] for d in found], ls).items():
+                    if line < found[i][0]:
+                        found[i] = (line,) + found[i][1:4] + (found[i][4]._replace(start=line),)
             stderr = r.stderr.decode(errors="replace").splitlines()
             entity = sg_entities(stderr)
             if r.returncode != 0:
@@ -467,8 +528,13 @@ def definitions(files, placed=False):
 
 
 def owner_chain(defs, line):
-    """The definitions whose range holds LINE, outermost first; a definition starting on LINE is the match itself."""
-    return [d for d in defs if d[0] < line <= d[1]]
+    """The definitions whose range holds LINE, outermost first, its leads included; a definition whose name is on LINE
+    is the match itself."""
+    return [d for d in defs if d.start <= line <= d.end and line != d.line]
+
+
+def json_def(d):
+    return dict(zip(JSON_DEF, d))
 
 
 def heading(path, line, defs):
@@ -731,7 +797,8 @@ def search(flags, patterns, paths, cap, count):
 def hits(argv):
     cap, flags, patterns, paths, digest, as_json = parse_hits_args(argv)
     collect_warnings(as_json)
-    per_file, rows, searched, errors, hidden = search(flags, patterns, paths, -1 if digest else cap,
+    per_file, rows, searched, errors, hidden = search(flags, patterns, paths,
+                                                       -1 if digest else max(cap, SHAPE_CAP) if as_json else cap,
                                                        digest or "matched_lines")
     total = sum(per_file.values())
     tag = lambda p: TAG if p in hidden else ""
@@ -741,13 +808,17 @@ def hits(argv):
         if searched == 0 and not hidden:
             die("searched 0 files; check the PATH arguments and the working directory")
     listed = total and not digest and total <= cap
-    defs, anchors, where = owners(rows, as_json) if listed else ({}, [], {})
+    # --json shapes the matches past the cap too, up to SHAPE_CAP
+    shaped = as_json and not digest and total <= max(cap, SHAPE_CAP)
+    defs, anchors, where = owners(rows, as_json) if listed or shaped and total else ({}, [], {})
     if as_json:
         files = sorted({r[0] for r in rows if r[3]})
+        doc = match_rows(rows, anchors, defs, where, hidden) if shaped else None
         print_json({"total": sum(r[3] for r in rows) if listed else total, "files": len(files) if listed else len(per_file),
                     "searched": searched, "cap": cap, "over": not digest and total > cap,
                     "counts": per_file if total and not listed else None,
-                    "rows": match_rows(rows, anchors, defs, where, hidden) if listed else None if total else [],
+                    "shapes": shapes(doc) if shaped else None,
+                    "rows": doc if listed else None if total else [],
                     "skips": skips(files, defs) if listed else [],
                     "hidden": [p for p in per_file if p in hidden], "errors": errors, "warnings": WARNINGS})
         return
@@ -855,22 +926,65 @@ def is_def(defs, num, text, col, end):
     return any(d.start <= num <= d.end and d.sig == text.strip() and d.name == text[col:end] for d in defs)
 
 
+def shape(text, col, end, below, where, is_def):
+    """The shape of the match at COL to END of TEXT, a line of code (see --help): def, its place WHERE when that is not
+    code, or the qualifier or word before it, ▮ for it, and the character after it. A match starting BELOW the line
+    is shaped by its place alone."""
+    if is_def:
+        return "def"
+    if where != "code" or below:
+        return where or "unparsed"
+    head = text[:col]
+    before = head.rstrip()
+    op = next((o for o in ("::", "->", ".") if before.endswith(o)), None)
+    if op:
+        before = before[:-len(op)].rstrip()
+    word = len(before) - next((i for i, c in enumerate(reversed(before)) if c not in WORD), len(before))
+    if op:
+        q = before[word:] + op
+    else:
+        q = before[word:] + " " if before != head and word < len(before) else ""
+    after = text[end:].lstrip()
+    return f"{q}▮{after[:1]}"
+
+
+def shapes(rows):
+    """One entry per shape of the matches in ROWS, JSON rows: its count, files, the names of up to three innermost
+    owners, and a sample; the most common first, ties in the order they appear."""
+    out = {}
+    for r in rows:
+        owner = r["owners"][-1]["name"] if r["owners"] else None
+        for s in r["subs"]:
+            e = out.get(s["shape"])
+            if e is None:
+                text = r["text"]
+                lead = len(text) - len(text.lstrip())
+                e = out[s["shape"]] = {"shape": s["shape"], "n": 0, "files": set(), "owners": {},
+                                        "sample": f"{r['file']}:{r['line']}  {clip(text.strip(), s['col'] - lead)}"}
+            e["n"] += 1
+            e["files"].add(r["file"])
+            e["owners"].setdefault(owner)
+    return sorted(({**e, "files": len(e["files"]), "owners": list(e["owners"])[:3]} for e in out.values()),
+                  key=lambda e: -e["n"])
+
+
 def match_rows(rows, anchors, defs, where, hidden):
     """The JSON row of each match in ROWS, with its owner chain, whether it looks like test code, its submatches placed
-    by WHERE and marked when they name a definition, and the context lines that belong to it."""
+    by WHERE, marked when they name a definition and shaped, and the context lines that belong to it."""
     out = {}
     for path, num, text, is_match, subs in rows:
         if is_match:
             own = defs[path] if isinstance(defs.get(path), list) else []
             chain = owner_chain(own, num)
             nodes = where.get(path)
-            out[path, num] = {"file": path, "line": num, "text": text, "owners": [d._asdict() for d in chain],
-                              "test": is_test(path, chain),
-                              "subs": [{"col": col, "end": end,
-                                        "in": None if nodes is None else place(nodes.get(num - 1 + below, ()), num - 1 + below, at),
-                                        "def": not below and is_def(own, num, text, col, end)}
-                                       for col, end, below, at in subs],
-                              "hidden": path in hidden, "ctx": []}
+            test = is_test(path, chain)
+            row = out[path, num] = {"file": path, "line": num, "text": text, "owners": [json_def(d) for d in chain],
+                                    "test": test, "subs": [], "hidden": path in hidden, "ctx": []}
+            for col, end, below, at in subs:
+                where_in = None if nodes is None else place(nodes.get(num - 1 + below, ()), num - 1 + below, at)
+                named = not below and is_def(own, num, text, col, end)
+                row["subs"].append({"col": col, "end": end, "in": where_in, "def": named,
+                                    "shape": ("test " if test else "") + shape(text, col, end, below, where_in, named)})
     for (path, num, text, is_match, _), anchor in zip(rows, anchors):
         if not is_match:
             out[path, anchor]["ctx"].append({"line": num, "text": text})
@@ -941,7 +1055,7 @@ def outline(argv):
     if no_parser:
         die("outline needs ast-grep, which is not installed")
     if as_json:
-        print_json({"files": [{"file": path, "defs": [{**d._asdict(), "depth": depth} for depth, d in
+        print_json({"files": [{"file": path, "defs": [{**json_def(d), "depth": depth} for depth, d in
                                                       nested(defs[path] if isinstance(defs.get(path), list) else [])]}
                               for path in present], "skips": skips(present, defs), "missing": missing,
                     "warnings": WARNINGS})

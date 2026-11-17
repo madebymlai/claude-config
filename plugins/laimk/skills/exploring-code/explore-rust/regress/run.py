@@ -79,6 +79,8 @@ fx      hits --count-matches NEEDLE_P1 flags
 fx      hits -c MANY_ --max 3
 fx      hits -C 1 NEEDLE_CTX
 fx      hits -C 2 NEEDLE_CTX ctx
+fx      hits LEADMARK leads
+fx      outline leads/a.rs leads/a.py leads/A.java
 fx      hits -C2 NEEDLE_CTX ctx/n.py
 fx      hits -A 1 NEEDLE_CTX
 fx      hits -B 2 NEEDLE_CTX
@@ -465,6 +467,10 @@ fx      hits --json NEEDLE_TRACKED
 fx      hits --json -U 'MLSTART\\n\\s*MLEND'
 fx      hits --json NEEDLE_RS
 fx      hits --json NEEDLE_C
+fx      hits --json LEADMARK leads
+fx      hits --json -w 'f|p|q|cased|same_line|m|toString|D' leads
+fx      outline --json leads/a.rs leads/a.py leads/A.java
+fx      hits --json MANY_ --max 0
 fx      hits --json NEEDLE_TESTNAME testnames
 fx      hits --json -w 'NEEDLE_DEFS?' testnames
 fx      hits --json -l NEEDLE_TESTNAME testnames
@@ -488,6 +494,7 @@ m       outline --json @ls:*
 r       hits --json -C 1 NEEDLE_
 helix   hits --json RetrainActor
 helix   hits --json -c 'fn ' src
+helix   hits --json -w model
 helix   outline --json @ls:*.rs
 taupos  hits --json CToInt src
 taupos  hits --json String

@@ -11,8 +11,8 @@ commands. Its stdout and exit codes are the Python script's, byte for byte, on t
   what the script reads from rg's JSON events: per-file counts, plus match and context rows until the cap is passed.
   Files are searched as raw bytes, as rg searches them. A line that is not UTF-8 is decoded as Latin-1 only for
   display, so a non-ASCII pattern matches exactly what it matches in rg. Memory is bounded by the rows kept (at most
-  the cap's worth), one entry per matching file, and the paths the walk takes. It never grows with the search's
-  output.
+  the cap's worth, or under `--json` 10,000 matching lines when the cap is lower, to digest their shapes), one entry
+  per matching file, and the paths the walk takes. It never grows with the search's output.
 - **Tracked files `.gitignore` hides.** These are `git ls-files -z` over the scope, minus the files a walk with
   explore's own flags (`--hidden --no-ignore-dot -g !.git`) takes, which is what the Python script computes. The
   search walk records what it takes when the user's flags leave that walk unchanged. Otherwise a separate walk
@@ -20,7 +20,9 @@ commands. Its stdout and exit codes are the Python script's, byte for byte, on t
   does.
 - **Definitions.** Each matched file is parsed with tree-sitter 0.27.2 and the grammar versions ast-grep 0.51.3
   locks, pinned with `=`. The parser looks for the same node kinds, the same name child and the same pre-order the
-  script's ast-grep rule uses. ast-grep's reasons for skipping a file map to the same labels:
+  script's ast-grep rule uses. A definition's range starts at the first of its leads, found as the script's `LEADS`
+  rules find them: a Rust `attribute_item` whose next sibling past attributes and comments is a definition, and a
+  Python `decorated_definition`. ast-grep's reasons for skipping a file map to the same labels:
   - `no language`: the exact-case extension is not one ast-grep knows, as with `.JAVA` or `.hxx`;
   - `emptyFile`;
   - `fileTooLarge`: over 3,000,000 bytes and 200,000 lines;
@@ -82,7 +84,8 @@ only the document and exits 0, with `outline`'s missing FILE arguments in `missi
 gives every match on the line in characters, and where it starts. `in` is `code`, `comment` or `string`, from
 the innermost of the file's comment, string and interpolation nodes that holds it (the Python script's PLACES
 table, in [`src/defs.rs`](src/defs.rs)). It is null for a file with no parse. These nodes are collected only for
-`--json`, from the same parse as the definitions.
+`--json`, from the same parse as the definitions. Each sub's `shape` and the document's `shapes` digest follow the
+script's `shape` and `shapes`, in [`src/json.rs`](src/json.rs).
 
 `regress/run.py` compares its JSON cases with `scripts/explore` byte for byte. When the bytes differ, it also says
 whether the documents are equal once decoded with msgspec. It reports any successful `--json` run, by either

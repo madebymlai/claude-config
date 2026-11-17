@@ -4,7 +4,8 @@
 
 The fixture is a git repository holding what the regression cases search: a definition-bearing file in each of the
 17 languages, Latin-1 contents and names, files with no definitions and files the parser skips, binary files,
-tracked files .gitignore hides, long lines, nested blocks for -C, and enough matches to pass a cap.
+tracked files .gitignore hides, long lines, nested blocks for -C, attributes and decorators above
+definitions, and enough matches to pass a cap.
 """
 import os
 import shutil
@@ -274,6 +275,64 @@ LATIN1 = {
     "lat/plain.txt": "caf\xe9 NEEDLE_LAT3\n",
 }
 
+LEADS = {
+    "leads/a.rs": """\
+#[derive(Debug)] // LEADMARK derive
+pub struct S;
+
+#[rstest]
+#[case::one(LEADMARK)]
+/* between */
+#[case::two(2)]
+fn cased(#[case] n: u32) -> u32 {
+    #[allow(unused)] let x = LEADMARK;
+    n
+}
+
+#[test] fn same_line() { LEADMARK; }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() { LEADMARK }
+}
+
+impl S {
+    #[inline]
+    pub fn m(&self) -> u32 { LEADMARK }
+}
+""",
+    "leads/a.py": """\
+@decorator(LEADMARK)
+@other
+def f():
+    return LEADMARK
+
+
+class K:
+    @property
+    # a comment LEADMARK
+    def p(self):
+        @inner(LEADMARK)
+        def q():
+            pass
+        return q
+
+
+@dataclass
+class D:
+    x: int = LEADMARK
+""",
+    "leads/A.java": """\
+@Entity // LEADMARK
+public class A {
+    @Override
+    @Deprecated(since = "LEADMARK")
+    public String toString() { return "LEADMARK"; }
+}
+""",
+}
+
 
 def write(rel, data, mode="w"):
     path = os.path.join(ROOT, rel) if isinstance(rel, str) else os.path.join(os.fsencode(ROOT), rel)
@@ -332,6 +391,9 @@ def main():
     write("testnames/x/prod.py", "class TestK:\n    def m(self): NEEDLE_TESTNAME\n"
           "class KTests:\n    def m(self): NEEDLE_TESTNAME\n"
           "class Contest:\n    def m(self): NEEDLE_TESTNAME\n")
+    # attributes, decorators and annotations above a definition, which its range takes in
+    for rel, text in LEADS.items():
+        write(rel, text)
     write("testnames/rs/lib.rs", "#[cfg(test)]\nmod gated;\nmod plain;\n#[cfg(test)]\n#[path = \"p.rs\"]\npub(crate) mod gated2;\n"
           "mod outer;\n#[cfg(test)] mod gated_dir;\nmod gatedx; // NEEDLE_TESTNAME\n")
     for rel in ("gated.rs", "plain.rs", "gated2.rs", "outer.rs", "gated_dir/mod.rs", "gated/sub.rs", "outer/inner.rs", "gatedx.rs"):

@@ -32,7 +32,11 @@ submodule's own .gitignore hides is found only when hits runs inside that
 submodule.
 
 Each match is shown under its owner chain (impl Foo > fn new), with the
-innermost definition's line range. Definitions come from a tree-sitter parse
+innermost definition's line range. A definition's range takes in the
+attributes, annotations or decorators above it, so a line holding one, such
+as an rstest #[case(...)], belongs to the definition it decorates; the line
+holding a definition's name is the match itself, shown under the definitions
+around it. Definitions come from a tree-sitter parse
 of the file, with the node kinds ast-grep 0.51.3 reports; a file in a language
 explore-rust does not parse shows (no parser), a file with no definitions
 shows (no definitions found), a file the parser skips shows
@@ -52,7 +56,8 @@ character, such as the . and ( of a pattern for .due(, which -w would match
 only beside another non-word character. -l and -c print one line per file with
 its count of matching lines, --count-matches with its count of matches. --max
 N (or --max=N) caps the matches printed (default 300); over the cap, hits
-prints counts by directory and file instead.
+prints counts by directory and file instead, and --json the shapes of the
+matches too.
 
 --json makes hits and outline print one JSON document, for a script to read;
 show prints text only, for reading. Paths are as the text prints them, lines
@@ -62,11 +67,18 @@ null when it has none (a Rust impl is named by its type). A skip is
 {file, why, reason?}: a file that shows no definitions, with why one of
 \"no parser\", \"no definitions\", \"failed\", \"skipped\" (reason: ast-grep's, or
 \"no language\").
-  hits:    {total, files, searched, cap, over, counts, rows, skips, hidden, errors}
+  hits:    {total, files, searched, cap, over, counts, shapes, rows, skips,
+           hidden, errors}
            total and files as the header counts them; counts is {path: n} for
            every file when the text prints counts (-l, -c, --count-matches, or
-           over the cap), else null. rows lists the matches when the text does,
-           and is null when it prints counts instead: {file, line, text,
+           over the cap), else null. shapes digests the matches by the shape
+           of each (see subs), over the cap too: one {shape, n, files, owners,
+           sample} per shape, most common first, with n its matches, files the
+           files they are in, owners the names of up to three innermost owners
+           (null for none) and sample the first one's file:line and text. It is
+           null with -l, -c or --count-matches, and past 10,000 matching lines
+           or the cap, whichever is higher. rows lists the matches when the
+           text does, and is null when it prints counts instead: {file, line, text,
            owners: [def, outermost first], test, subs, hidden, ctx}, with text
            the whole line and ctx the -A/-B/-C lines grouped with it,
            [{line, text}]. test is a guess from names that the match is test
@@ -75,14 +87,21 @@ null when it has none (a Rust impl is named by its type). A skip is
            *.spec.ts, ...), or an owner that is a module named tests or test or
            a class named Test*, *Test or *Tests; it cannot see a test module
            declared in another file, as #[cfg(test)] mod x; does. subs has one
-           {col, end, in, def} per match on the line: col and end are 0-based
-           character columns, the match being text[col:end] (under -U a match
+           {col, end, in, def, shape} per match on the line: col and end are
+           0-based character columns, the match being text[col:end] (under -U a match
            may run on into the lines below, its columns counting their
            newlines); in is where the match starts: \"code\", \"comment\" or
            \"string\", or null when ast-grep did not parse the file, or a warning
            says its lines are too long to place matches in; def is true when
-           the match is the name of a definition this line holds. hidden lists
-           the matched files tagged hidden, errors all of rg's errors.
+           the match is the name of a definition this line holds. shape is
+           \"def\" for such a match, else \"comment\", \"string\" or \"unparsed\" (in
+           null), else Q▮C: C is the first character after the match past
+           spaces, and Q is the . :: or -> right before it with the word before
+           that (s.▮( store::▮( .▮), else the word before it and a space
+           (new ▮), else empty (▮(). \"test \" leads the shape on a test row. A
+           match starting below its row's line (-U) is shaped by in alone.
+           hidden lists the matched files tagged hidden, errors all of rg's
+           errors.
   outline: {files: [{file, defs: [def + depth]}], skips, missing}
            missing lists the FILE arguments that are not files.
 warnings (both) holds what text mode writes to stderr, so a --json run that
