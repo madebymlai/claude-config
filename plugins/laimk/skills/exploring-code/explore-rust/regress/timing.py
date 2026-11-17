@@ -27,6 +27,9 @@ CASES = [
     (H, ["hits", "RetrainActor"]),
     (H, ["hits", "ZZZ_NO_MATCH_XYZ"]),
     (R, ["hits", "NEEDLE_"]),
+    (T, ["hits", "--json", "-w", "CToInt"]),
+    (T, ["hits", "--json", "CToInt", "src"]),
+    (H, ["hits", "--json", "RetrainActor"]),
 ]
 MEMORY_CASES = [(H, ["hits", "-l", "-uu", ""])]
 

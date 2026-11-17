@@ -64,10 +64,15 @@ null when it has none (a Rust impl is named by its type). A skip is
            total and files as the header counts them; counts is {path: n} for
            every file when the text prints counts (-l, -c, --count-matches, or
            over the cap), else null. rows lists the matches, when the text does:
-           {file, line, text, owners: [def, outermost first], hidden, ctx}, with
-           text the whole line and ctx the -A/-B/-C lines grouped with it,
-           [{line, text}]. hidden lists the matched files tagged hidden, errors
-           all of rg's errors.
+           {file, line, text, owners: [def, outermost first], subs, hidden,
+           ctx}, with text the whole line and ctx the -A/-B/-C lines grouped
+           with it, [{line, text}]. subs has one {col, end, in} per match on
+           the line: 0-based character columns (under -U a match may run on
+           into the lines below, its columns counting their newlines), and in,
+           where the match starts: \"code\", \"comment\" or \"string\", or null when
+           ast-grep did not parse the file, or a warning says its lines are too
+           long to place matches in. hidden lists the matched files tagged
+           hidden, errors all of rg's errors.
   outline: {files: [{file, defs: [def + depth]}], skips, missing}
            missing lists the FILE arguments that are not files.
 warnings (both) holds what text mode writes to stderr, so a --json run that
@@ -302,7 +307,9 @@ fn py_repr(s: &[u8]) -> String {
 fn main() {
     let mut argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     let mut out = Out(BufWriter::new(std::io::stdout().lock()));
-    if argv.is_empty() || argv[0] == "-h" || argv[0] == "--help" {
+    // -h or --help anywhere before a -- asks for this help, whichever command it follows
+    let before_dashes = argv.iter().take_while(|a| *a != "--");
+    if argv.is_empty() || before_dashes.into_iter().any(|a| a == "-h" || a == "--help") {
         out.line(HELP);
         out.flush().ok();
         return;

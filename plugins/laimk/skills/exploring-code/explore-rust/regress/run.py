@@ -36,6 +36,7 @@ DIRS = {
     "taupos": "/home/laimk/git/dsrs/taupos-self-interface",
     "tmp": "/tmp",
     "corpus": "/tmp/explore-rust-corpus",
+    "places": "/tmp/explore-json/subs/places",
     "beads": "/home/laimk/git/beads",
     "archi": "/home/laimk/git/archi-LAI",
     "jobjoy": "/home/laimk/git/jobjoy",
@@ -52,6 +53,12 @@ fx      --help
 fx      -h
 fx
 fx      bogus
+fx      hits --help
+fx      outline -h
+fx      hits -ih NEEDLE_P1 flags
+fx      hits -- --help flags
+fx      show langs/a.rs:3 --help
+fx      hits NEEDLE_P1 flags -- -h
 fx      hits
 fx      hits NEEDLE_
 fx      hits ZZZ_NO_MATCH
@@ -477,6 +484,22 @@ helix   outline --json @ls:*.rs
 taupos  hits --json CToInt src
 taupos  hits --json String
 taupos  outline --json {LATIN1_JAVA}
+taupos  hits --json -w CToInt
+taupos  hits --json -C 1 -w CToInt src
+places  hits --json 'NEEDLE_(code|comment|string)'
+places  hits --json -U 'NEEDLE_code,\\n\\s*x\\)|NEEDLE_comment'
+places  hits --json -i needle_
+places  hits --json -v -e NEEDLE notes.txt a.rs
+places  hits --json -w NEEDLE_code -C 2
+fx      hits --json 'NEEDLE_[A-Z]+[0-9]'
+fx      hits --json NEEDLE_LONG5
+fx      hits --json -E latin1 NEEDLE_LAT
+fx      hits --json 'x=1' flags/count.txt
+fx      hits --json '' flags/line.txt
+fx      hits --json -v -c x flags/count.txt
+fx      hits --json -v NEEDLE flags/line.txt
+fx      hits --json -U 'MLSTART\\n'
+fx      hits --json --null-data NEEDLE_NUL nul
 corpus  outline --json @glob:**/*
 """.replace("{LATIN1_JAVA}", LATIN1_JAVA)
 

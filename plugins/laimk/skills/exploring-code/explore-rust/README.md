@@ -78,7 +78,11 @@ from. `--help` gives the schema. The structs in [`src/json.rs`](src/json.rs) dec
 script's key order, and serde_json's compact writer escapes as `json.dumps(separators=(",", ":"),
 ensure_ascii=False)` does. A name that is not UTF-8 holds each undecodable byte as the text prints it, as the six
 characters `\udcXX`, which JSON writes as `\\udcXX`. `show` refuses `--json`. A `--json` run that succeeds writes
-only the document and exits 0, with `outline`'s missing FILE arguments in `missing`.
+only the document and exits 0, with `outline`'s missing FILE arguments in `missing`. Each `hits` row's `subs`
+gives every match on the line in characters, and where it starts. `in` is `code`, `comment` or `string`, from
+the innermost of the file's comment, string and interpolation nodes that holds it (the Python script's PLACES
+table, in [`src/defs.rs`](src/defs.rs)). It is null for a file with no parse. These nodes are collected only for
+`--json`, from the same parse as the definitions.
 
 `regress/run.py` compares its JSON cases with `scripts/explore` byte for byte. When the bytes differ, it also says
 whether the documents are equal once decoded with msgspec. It reports any successful `--json` run, by either
@@ -89,8 +93,13 @@ message and no document.
 ## Deliberate differences from the Python script
 
 - **`--help`** describes this binary: tree-sitter instead of ast-grep.
+- **No size guard on `in`.** The Python script skips the comments and strings of a file whose lines would make
+  ast-grep print over 64 MB, such as a minified bundle, and gives its `subs` `in: null` with a warning.
+  explore-rust reads those nodes from the parse it already holds, so it places such a file's matches too. No
+  regression case reaches the budget.
 - **`warnings` is always empty in `--json`.** The Python script lists there that ast-grep is missing or exited
-  nonzero, and without ast-grep its `outline` fails. explore-rust parses in process and has neither to report.
+  nonzero, or that a file's lines are too long to place, and without ast-grep its `outline` fails. explore-rust
+  parses in process and has none of these to report.
 - **Line numbers in `show`** must be ASCII digits. Python's `isdigit` and `\d` also accept other scripts' digits.
 
 ## Regression harness

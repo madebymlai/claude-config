@@ -69,7 +69,7 @@ pub fn hits(argv: Vec<OsString>, out: &mut Out) {
             out.line(&format!("  {n:>6}  {}{}", py::display(p), tag(p)));
         }
     } else {
-        print_grouped(&group(&listed(rows)), &tag, out);
+        print_grouped(&group(&listed(rows, false)), &tag, out);
     }
     if !errors.is_empty() {
         out.line(&format!(
@@ -96,7 +96,7 @@ fn document<'a>(
     let over = args.digest.is_none() && total > args.cap;
     let hidden_files = files.iter().filter(|(p, _)| hidden.contains(p)).map(|(p, _)| json::Name::new(p)).collect();
     let (total, count, counts, listing) = if listed_files {
-        let listing = listed(rows);
+        let listing = listed(rows, true);
         let matched = listing.iter().filter(|f| f.rows.iter().any(|r| r.is_match)).count();
         let matches = listing.iter().map(|f| f.rows.iter().filter(|r| r.is_match).count() as u64).sum();
         (matches, matched, None, listing)
@@ -175,10 +175,13 @@ pub struct Listed {
     pub anchors: Vec<u64>,
     /// None for a file with no parser
     pub parsed: Option<Parsed>,
+    /// its comments and strings, when they were looked for and it parsed
+    pub places: Option<Vec<crate::defs::Place>>,
 }
 
-/// The rows of each file sorted, anchored and parsed, files in Python's order.
-fn listed(rows: HashMap<Vec<u8>, HashSet<Row>>) -> Vec<Listed> {
+/// The rows of each file sorted, anchored and parsed, files in Python's order; with PLACED, each parsed file's
+/// comments and strings too.
+fn listed(rows: HashMap<Vec<u8>, HashSet<Row>>, placed: bool) -> Vec<Listed> {
     let mut files: Vec<(Vec<u8>, Vec<Row>)> = rows
         .into_iter()
         .map(|(p, set)| {
@@ -188,7 +191,7 @@ fn listed(rows: HashMap<Vec<u8>, HashSet<Row>>) -> Vec<Listed> {
         })
         .collect();
     files.sort_by_cached_key(|(p, _)| py::sort_key(p));
-    let mut defs = Definitions::new();
+    let mut defs = if placed { Definitions::with_places() } else { Definitions::new() };
     let matched: Vec<Vec<u8>> =
         files.iter().filter(|(_, rs)| rs.iter().any(|r| r.is_match)).map(|(p, _)| p.clone()).collect();
     defs.parse_all(&matched);
@@ -207,7 +210,8 @@ fn listed(rows: HashMap<Vec<u8>, HashSet<Row>>) -> Vec<Listed> {
                 })
                 .collect();
             let parsed = defs.files.remove(&path).flatten();
-            Listed { path, rows, anchors, parsed }
+            let places = defs.places.remove(&path).filter(|_| matches!(parsed, Some(Parsed::Defs(_))));
+            Listed { path, rows, anchors, parsed, places }
         })
         .collect()
 }

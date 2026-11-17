@@ -23,6 +23,43 @@ pub struct Def {
     pub sig: String,
 }
 
+/// A comment or a string, or code put back inside a string, with 0-based lines and columns in characters, as
+/// ast-grep reports a node's range.
+#[derive(Clone, Copy)]
+pub struct Place {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    /// "comment", "string" or "code"
+    pub what: &'static str,
+}
+
+/// The Python script's PLACES: per language, the node kinds a match sits in when it is in a comment or a string,
+/// and those that put code back inside a string, such as an interpolation.
+const PLACES: &[(&str, &str, &str, &str)] = &[
+    ("rust", "line_comment block_comment", "string_literal raw_string_literal char_literal", ""),
+    ("java", "line_comment block_comment", "string_literal character_literal", "string_interpolation"),
+    ("kotlin", "line_comment multiline_comment", "string_literal character_literal", "interpolated_expression interpolated_identifier"),
+    ("python", "comment", "string", "interpolation"),
+    ("javascript", "comment html_comment", "string template_string regex jsx_text", "template_substitution"),
+    ("typescript", "comment", "string template_string regex", "template_substitution"),
+    ("tsx", "comment", "string template_string regex jsx_text", "template_substitution"),
+    ("go", "comment", "interpreted_string_literal raw_string_literal rune_literal", ""),
+    (
+        "csharp",
+        "comment",
+        "string_literal verbatim_string_literal raw_string_literal interpolated_string_expression character_literal",
+        "interpolation",
+    ),
+    ("c", "comment", "string_literal char_literal system_lib_string", ""),
+    ("cpp", "comment", "string_literal char_literal raw_string_literal system_lib_string", ""),
+    ("ruby", "comment", "string heredoc_body regex character subshell delimited_symbol string_array", "interpolation"),
+    ("php", "comment", "string encapsed_string heredoc nowdoc", ""),
+    ("swift", "comment multiline_comment", "line_string_literal multi_line_string_literal raw_string_literal", "interpolated_expression"),
+    ("scala", "comment block_comment", "string interpolated_string interpolated_string_expression character_literal", "interpolation"),
+    ("lua", "comment", "string", ""),
+    ("bash", "comment", "string raw_string ansi_c_string heredoc_body", "command_substitution expansion simple_expansion"),
+];
+
 /// What a file's parse gave: its definitions sorted by start and then by end, outermost first, or why it was not
 /// parsed, worded as ast-grep reports it.
 pub enum Parsed {
@@ -223,6 +260,8 @@ struct Compiled {
     name_fields: Vec<Option<u16>>,
     name_kinds: Vec<Vec<u16>>,
     type_field: Option<u16>,
+    /// the place of each comment, string and interpolation kind
+    places: HashMap<u16, &'static str>,
 }
 
 fn compile(lang: &Lang) -> Compiled {
@@ -251,7 +290,14 @@ fn compile(lang: &Lang) -> Compiled {
         }
     }
     let type_field = (lang.name == "rust").then(|| language.field_id_for_name("type").expect("rust has a type field").get());
-    Compiled { language, kinds, arrow_parent, arrow, name_fields, name_kinds, type_field }
+    let (_, comment, string, code) = PLACES.iter().find(|p| p.0 == lang.name).expect("every language has its places");
+    let mut places = HashMap::new();
+    for (what, list) in [("comment", comment), ("string", string), ("code", code)] {
+        for k in list.split_whitespace() {
+            places.insert(kind(k), what);
+        }
+    }
+    Compiled { language, kinds, arrow_parent, arrow, name_fields, name_kinds, type_field, places }
 }
 
 impl Compiled {
@@ -287,6 +333,32 @@ impl Compiled {
     }
 }
 
+/// Byte columns as character columns, one line's table at a time; a line in ASCII needs none.
+#[derive(Default)]
+struct CharColumns {
+    row: Option<usize>,
+    /// the character column of each byte column of ROW, with one more for its end
+    table: Vec<usize>,
+}
+
+impl CharColumns {
+    fn of(&mut self, lines: &[String], row: usize, byte: usize) -> usize {
+        let Some(line) = lines.get(row) else { return byte };
+        if line.is_ascii() {
+            return byte;
+        }
+        if self.row != Some(row) {
+            self.table.clear();
+            for (n, c) in line.chars().enumerate() {
+                self.table.extend(std::iter::repeat_n(n, c.len_utf8()));
+            }
+            self.table.push(line.chars().count());
+            self.row = Some(row);
+        }
+        self.table.get(byte).copied().unwrap_or(byte)
+    }
+}
+
 /// The name TEXT gives: for C and C++ the declarator's words before its parameters, without pointer or reference
 /// marks.
 fn name_of(lang: &str, text: &str) -> String {
@@ -302,11 +374,20 @@ fn name_of(lang: &str, text: &str) -> String {
 pub struct Definitions {
     compiled: HashMap<&'static str, Compiled>,
     pub files: HashMap<Vec<u8>, Option<Parsed>>,
+    /// whether to find each parsed file's comments and strings too
+    with_places: bool,
+    /// the comments and strings of each file parsed with them
+    pub places: HashMap<Vec<u8>, Vec<Place>>,
 }
 
 impl Definitions {
     pub fn new() -> Self {
-        Definitions { compiled: HashMap::new(), files: HashMap::new() }
+        Definitions { compiled: HashMap::new(), files: HashMap::new(), with_places: false, places: HashMap::new() }
+    }
+
+    /// Definitions that find each parsed file's comments and strings as well.
+    pub fn with_places() -> Self {
+        Definitions { with_places: true, ..Definitions::new() }
     }
 
     /// The parse of PATH, or None for a file with no language: Python's (no parser). LINES reads the file's lines
@@ -324,23 +405,27 @@ impl Definitions {
         let todo: Vec<&Vec<u8>> = paths.iter().filter(|p| !self.files.contains_key(p.as_slice())).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(todo.len().max(1));
-        let parsed: Vec<Vec<(Vec<u8>, Option<Parsed>)>> = std::thread::scope(|scope| {
+        let parsed: Vec<(Vec<(Vec<u8>, Option<Parsed>)>, HashMap<Vec<u8>, Vec<Place>>)> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
                     scope.spawn(|| {
-                        let (mut own, mut lines, mut done) = (Definitions::new(), crate::Lines::default(), Vec::new());
+                        let mut own = Definitions { with_places: self.with_places, ..Definitions::new() };
+                        let (mut lines, mut done) = (crate::Lines::default(), Vec::new());
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(path) = todo.get(i) else { break };
                             done.push((path.to_vec(), language(path).map(|lang| own.parse(path, lang, &mut lines))));
                         }
-                        done
+                        (done, own.places)
                     })
                 })
                 .collect();
             workers.into_iter().map(|w| w.join().expect("a parse does not panic")).collect()
         });
-        self.files.extend(parsed.into_iter().flatten());
+        for (done, places) in parsed {
+            self.files.extend(done);
+            self.places.extend(places);
+        }
     }
 
     fn parse(&mut self, path: &[u8], lang: &'static Lang, lines: &mut crate::Lines) -> Parsed {
@@ -376,9 +461,21 @@ impl Definitions {
         };
         let file_lines = lines.insert(path, &text);
         let mut defs = Vec::new();
+        let mut places = Vec::new();
+        let mut columns = CharColumns::default();
         let mut cursor = tree.walk();
         'walk: loop {
             let node = cursor.node();
+            if self.with_places
+                && let Some(&what) = compiled.places.get(&node.kind_id())
+            {
+                let (s, e) = (node.start_position(), node.end_position());
+                places.push(Place {
+                    start: (s.row, columns.of(file_lines, s.row, s.column)),
+                    end: (e.row, columns.of(file_lines, e.row, e.column)),
+                    what,
+                });
+            }
             if compiled.is_definition(node) {
                 let (start, end) = (node.start_position().row + 1, node.end_position().row + 1);
                 let name = compiled.name_node(node);
@@ -396,6 +493,9 @@ impl Definitions {
                     break 'walk;
                 }
             }
+        }
+        if self.with_places {
+            self.places.insert(path.to_vec(), places);
         }
         // by lines, then bytes, then the definition's own fields, as the Python script sorts ast-grep's matches
         defs.sort_by(|(a_bytes, a), (b_bytes, b)| {

@@ -30,6 +30,18 @@ pub struct Row {
     pub is_match: bool,
     /// the character column of the line's first match
     pub column: usize,
+    /// every match on a match row: its submatches
+    pub subs: Vec<Sub>,
+}
+
+/// A submatch, in characters of the text rg reports for its row, which under -U runs on into the lines below.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sub {
+    pub col: usize,
+    pub end: usize,
+    /// how many lines below the row's line it starts, and its column in that line
+    pub below: usize,
+    pub at: usize,
 }
 
 pub struct Found {
@@ -376,9 +388,9 @@ struct Collect<'a, M> {
     rows: Vec<Row>,
 }
 
-/// grep-printer's `find_iter_at_in_context` and `record_matches`: the matches of a reported line, as the number
-/// of them and the start of the first, relative to the line. Only the first is looked for unless ALL.
-fn submatches<M: Matcher>(searcher: &Searcher, m: &M, buf: &[u8], range: Range<usize>, all: bool) -> (u64, Option<usize>) {
+/// grep-printer's `find_iter_at_in_context` and `record_matches`: the matches of a reported line, as byte ranges
+/// relative to the line. Only the first is looked for unless ALL.
+fn submatches<M: Matcher>(searcher: &Searcher, m: &M, buf: &[u8], range: Range<usize>, all: bool) -> Vec<(usize, usize)> {
     let mut bytes = buf;
     if searcher.multi_line_with_matcher(m) {
         if bytes[range.end..].len() >= MAX_LOOK_AHEAD {
@@ -396,42 +408,58 @@ fn submatches<M: Matcher>(searcher: &Searcher, m: &M, buf: &[u8], range: Range<u
         }
         bytes = &buf[..end];
     }
-    let (mut count, mut first, mut last) = (0u64, None, None);
+    let mut found = Vec::new();
     let _ = m.find_iter_at(bytes, range.start, |mat| {
         if mat.start() >= range.end {
             return false;
         }
-        count += 1;
-        first.get_or_insert(mat.start() - range.start);
-        last = Some(mat);
+        found.push((mat.start() - range.start, mat.end() - range.start));
         all
     });
     // an empty match at the end of the buffer is not reported
-    if let Some(l) = last
-        && l.is_empty()
-        && l.start() - range.start >= buf.len()
-    {
-        count -= 1;
-        if count == 0 {
-            first = None;
-        }
+    if found.last().is_some_and(|&(start, end)| start == end && start >= buf.len()) {
+        found.pop();
     }
-    (count, first)
+    found
 }
 
-/// Python's `text_of`, then its first line: the text of rg's `lines`, as UTF-8 or else Latin-1, and the character
-/// column of byte offset START in it.
-fn row(bytes: &[u8], start: usize, line: u64, is_match: bool) -> Row {
-    let (text, column) = match std::str::from_utf8(bytes) {
+/// Python's `text_of` and `submatches`: the text of rg's `lines`, as UTF-8 or else Latin-1, its first line, and
+/// SUBS, byte ranges in it, as characters. A byte offset inside a character counts the characters before it.
+fn row(bytes: &[u8], subs: &[(usize, usize)], line: u64, is_match: bool) -> Row {
+    let (text, chars): (String, Vec<usize>) = match std::str::from_utf8(bytes) {
         Ok(t) => {
-            let prefix = &bytes[..start.min(bytes.len())];
-            (t.to_string(), prefix.utf8_chunks().map(|c| c.valid().chars().count()).sum())
+            let mut counted = (0, 0);
+            let chars = subs
+                .iter()
+                .flat_map(|&(s, e)| [s, e])
+                .map(|offset| {
+                    let mut at = offset.min(t.len());
+                    while !t.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    // offsets ascend, so the count carries on from the last one
+                    counted.1 += t[counted.0.min(at)..at].chars().count();
+                    counted.0 = counted.0.max(at);
+                    counted.1
+                })
+                .collect();
+            (t.to_string(), chars)
         }
-        Err(_) => (encoding_rs::mem::decode_latin1(bytes).into_owned(), start),
+        Err(_) => (encoding_rs::mem::decode_latin1(bytes).into_owned(), subs.iter().flat_map(|&(s, e)| [s, e]).collect()),
     };
-    let text = text.trim_end_matches('\n');
-    let first = text.split('\n').next().unwrap_or("").to_string();
-    Row { line, text: first, is_match, column }
+    let subs: Vec<Sub> = chars
+        .chunks(2)
+        .map(|c| {
+            let (col, end) = (c[0], c[1]);
+            let before: Vec<char> = text.chars().take(col).collect();
+            let below = before.iter().filter(|&&ch| ch == '\n').count();
+            let at = if below > 0 { col - before.iter().rposition(|&ch| ch == '\n').expect("a newline") - 1 } else { col };
+            Sub { col, end, below, at }
+        })
+        .collect();
+    let column = subs.first().map_or(0, |s| s.col);
+    let first = text.trim_end_matches('\n').split('\n').next().unwrap_or("").to_string();
+    Row { line, text: first, is_match, column, subs }
 }
 
 impl<M: Matcher> Sink for Collect<'_, M> {
@@ -440,12 +468,12 @@ impl<M: Matcher> Sink for Collect<'_, M> {
     fn matched(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         self.matched_lines += mat.lines().count() as u64;
         if self.want_rows || self.count_matches {
-            let (count, first) =
-                submatches(searcher, self.matcher, mat.buffer(), mat.bytes_range_in_buffer(), self.count_matches);
-            self.matches += count;
+            let all = self.count_matches || self.want_rows;
+            let subs = submatches(searcher, self.matcher, mat.buffer(), mat.bytes_range_in_buffer(), all);
+            self.matches += subs.len() as u64;
             if self.want_rows {
                 let line = mat.line_number().expect("line numbers are on");
-                self.rows.push(row(mat.bytes(), first.unwrap_or(0), line, true));
+                self.rows.push(row(mat.bytes(), &subs, line, true));
                 self.match_rows += 1;
                 // past the cap no row is printed, only the counts
                 self.want_rows = self.match_rows <= self.cap;
@@ -456,7 +484,7 @@ impl<M: Matcher> Sink for Collect<'_, M> {
 
     fn context(&mut self, _: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, Self::Error> {
         if self.want_rows {
-            self.rows.push(row(ctx.bytes(), 0, ctx.line_number().expect("line numbers are on"), false));
+            self.rows.push(row(ctx.bytes(), &[], ctx.line_number().expect("line numbers are on"), false));
         }
         Ok(true)
     }

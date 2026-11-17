@@ -7,7 +7,7 @@ use serde::ser::SerializeMap;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::defs::{Def, Parsed};
+use crate::defs::{Def, Parsed, Place};
 use crate::hits::{Listed, owner_chain};
 use crate::py;
 
@@ -93,8 +93,32 @@ pub struct Row<'a> {
     pub line: u64,
     pub text: &'a str,
     pub owners: Vec<JsonDef<'a>>,
+    pub subs: Vec<Sub>,
     pub hidden: bool,
     pub ctx: Vec<Ctx<'a>>,
+}
+
+/// A submatch: its character columns, and whether it starts in code, a comment or a string.
+#[derive(Serialize)]
+pub struct Sub {
+    col: usize,
+    end: usize,
+    #[serde(rename = "in")]
+    place: Option<&'static str>,
+}
+
+/// Where a character at 0-based LINE and COL sits among PLACES: in the innermost that holds it, the one starting
+/// last, else in code.
+fn place(places: &[Place], line: usize, col: usize) -> &'static str {
+    places
+        .iter()
+        .filter(|p| p.start <= (line, col) && (line, col) < p.end)
+        // the first of equals, as Python's max keeps
+        .fold(None::<&Place>, |best, p| match best {
+            Some(b) if (b.start, std::cmp::Reverse(b.end)) >= (p.start, std::cmp::Reverse(p.end)) => Some(b),
+            _ => Some(p),
+        })
+        .map_or("code", |p| p.what)
 }
 
 /// Per-file counts, as a JSON object in the files' order.
@@ -162,6 +186,15 @@ impl Serialize for HitsOwned<'_> {
                     line: r.line,
                     text: &r.text,
                     owners: owner_chain(defs, r.line).into_iter().map(JsonDef::from).collect(),
+                    subs: r
+                        .subs
+                        .iter()
+                        .map(|s| Sub {
+                            col: s.col,
+                            end: s.end,
+                            place: f.places.as_deref().map(|p| place(p, r.line as usize - 1 + s.below, s.at)),
+                        })
+                        .collect(),
                     hidden: self.tagged.contains(&f.path),
                     ctx: Vec::new(),
                 });
