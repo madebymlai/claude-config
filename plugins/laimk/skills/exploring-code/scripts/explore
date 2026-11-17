@@ -202,7 +202,7 @@ DROPPED = {"-n", "-N", "-R", "-H", "--with-filename", "--extended-regexp", "--li
 DIGEST = {"-l", "-c", "--files-with-matches", "--count", "--count-matches"}
 # rg's flags that hits cannot honour: those of its standard printer and their negations, which leave its JSON as it
 # is, those that replace the search with other output, and those that only write to stderr
-REFUSED = {"--files", "--files-without-match", "--vimgrep", "-q", "--quiet", "-r", "--replace", "--passthru",
+REFUSED = {"--files", "--files-without-match", "--vimgrep", "-q", "--quiet", "-r", "--replace", "--passthru", "--passthrough",
            "--stats", "--null", "-0", "--heading", "-p", "--pretty",
            "-b", "--byte-offset", "--no-byte-offset", "--column", "--no-column", "--context-separator",
            "--no-context-separator", "--field-context-separator", "--field-match-separator", "--hostname-bin",
