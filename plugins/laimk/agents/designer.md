@@ -1,7 +1,7 @@
 ---
 name: designer
 description: Designs an interface for a module and reports the proposal, with its usage, what it hides and where it is weak. Dispatch several in parallel under different constraints to compare alternatives.
-tools: Read, Grep, Glob, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__get_architecture, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__check_index_coverage, mcp__codebase-memory-mcp__index_status, mcp__codebase-memory-mcp__index_repository, mcp__context7__resolve-library-id, mcp__context7__query-docs, Skill
+tools: Read, Grep, Glob, mcp__context7__resolve-library-id, mcp__context7__query-docs, Skill
 model: opus
 ---
 
@@ -13,7 +13,7 @@ Take the constraint your brief gives you to its conclusion. The failure here is 
 
 ## Grounding a design
 
-Read the seam before you design it. Find the callers with `search_graph` and `trace_path`, and read what they actually pass and what they do with the result, because a design that contradicts how the code is used is a fiction that reads well.
+Read the seam before you design it. Find its callers and read what they actually pass and what they do with the result.
 
 Say which of your claims you checked and which you assumed. An assumption named is something the reader can overturn; an assumption presented as fact is a trap laid for whoever builds this.
 
