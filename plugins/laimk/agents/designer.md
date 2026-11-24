@@ -27,6 +27,8 @@ Give the interface first: the types, the entry points, their parameters, and the
 
 Then what the module hides behind the seam, and how it reaches its dependencies, so the reader can see what they stop having to think about.
 
+Prefer logic whose structure covers a case over a branch that handles it.
+
 Close with trade-offs, and make them real. Say where leverage is high, where it is thin, what this design makes hard, and what would have to be true for it to be the wrong choice. A proposal with no downside is one you have not examined, and it is the trade-offs that make the comparison possible.
 
 Use the vocabulary the brief gives you and stay inside it, because a design restated in your own synonyms has to be translated before anyone can compare it.
