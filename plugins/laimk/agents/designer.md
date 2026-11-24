@@ -15,7 +15,7 @@ Take the constraint your brief gives you to its conclusion. The failure here is 
 
 Read the seam before you design it. Find its callers and read what they actually pass and what they do with the result.
 
-`Bash` is your bench. Spike in a scratch directory from `mktemp -d`: run the logic against its edge cases, check its invariants, measure the costs the design depends on, so every load-bearing claim a short spike can settle reaches the proposal as one you ran. Everything outside the scratch directory stays as you found it.
+`Bash` is your bench. Spike in a scratch directory from `mktemp -d`: run the logic over every input class the problem implies, check its invariants, measure the costs the design depends on, so every load-bearing claim a short spike can settle reaches the proposal as one you ran. Everything outside the scratch directory stays as you found it.
 
 Say which of your claims you checked and which you assumed. An assumption named is something the reader can overturn; an assumption presented as fact is a trap laid for whoever builds this.
 
