@@ -18,7 +18,7 @@ Show this to the user, then immediately proceed to Step 2. The user reads and th
 
 ### 2. Spawn designers
 
-Spawn 3+ sub-agents in parallel with the Agent tool (`subagent_type: "laimk:designer"`). The `designer` agent is the one to use: it has no write tool, so it cannot drift from proposing into building. Start the prompt with a line naming the constraint the agent carries, so the returning results stay tellable apart.
+Spawn 3+ sub-agents in parallel with the Agent tool (`subagent_type: "laimk:designer"`). Start the prompt with a line naming the constraint the agent carries, so the returning results stay tellable apart.
 
 Each must produce a **radically different** interface for the deepened module.
 
