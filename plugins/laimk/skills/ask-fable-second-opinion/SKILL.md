@@ -28,7 +28,7 @@ The brief is **neutral**: it describes what is, never what to build. A strong en
 - The unknowns from step 2.
 - The ask, verbatim:
 
-> Design the solution. The context above is complete; your shell is for testing logic. Keep complexity low and proportional to the problem's scope, and weigh each piece of it against the value it buys: a larger problem can warrant a more involved design when that is genuinely the better solution. Get the logic right first, walking every input class, ordering and failure the problem implies, with the invariants explicit. Then weigh performance on the hot path at the sizes given, and maintainability: where the next likely change lands and whether it lands in one place. Sketch at least two genuinely different approaches and keep the one whose value best justifies its complexity. Besides the proposal, report the edge-case walk, what you ran on the bench and what it showed, and the approach that lost and why.
+> Design the solution. The context above is complete; your shell is for testing logic. Get the logic right first, walking every input class, ordering and failure the problem implies, with the invariants explicit. Then weigh performance on the hot path at the sizes given, and maintainability: where the next likely change lands and whether it lands in one place. Sketch at least two genuinely different approaches and keep the one that spends complexity best. Besides the proposal, report the walk, what you ran on the bench and what it showed, and the approach that lost and why.
 
 Done when a read-through finds no candidate solution, no direction hinted by wording, and no name that is neither defined nor excerpted.
 
